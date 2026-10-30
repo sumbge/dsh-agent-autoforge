@@ -1,0 +1,18 @@
+# CLI 验证用 overlay：headless profile + autoforge 服务 + 本机网关路由。
+- insert:
+    - id: agent-autoforge-tools
+      name: '@local/dsh-agent-autoforge'
+      config:
+        python: python
+        cwd: C:\Users\32535\Desktop\dsh\autoforge-svc-gw
+        home: C:\Users\32535\Desktop\dsh\autoforge-svc-gw\.data
+        skills: C:\Users\32535\AppData\Local\autoforge\skills
+        timeoutMs: 600000
+    - id: llm-xdpool-verify
+      name: '@local/dsh-agent-autoforge/xdpool-route'
+      config:
+        distribution: expiry
+- id: agent-default-model
+  config:
+    provider: xdpool
+    model: deepseek-v4.1-flash

@@ -1,0 +1,34 @@
+{
+  "name": "@local/dsh-agent-autoforge",
+  "version": "0.3.1",
+  "private": true,
+  "description": "Agent preset that mounts the autoforge service (memory, missions, skills, durable tools) as model-facing DSH tools.",
+  "type": "module",
+  "exports": {
+    ".": "./lib/index.js",
+    "./xdpool-route": "./presets/xdpool-route.mjs",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "lib",
+    "presets",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./presets/autoforge.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.5",
+    "@deepseek-ai/dsh-tools": ">=0.2.1-rc.2 <0.3.0"
+  },
+  "license": "MIT",
+  "engines": {
+    "dsh": ">=0.2.1-rc.2 <0.3.0"
+  }
+}

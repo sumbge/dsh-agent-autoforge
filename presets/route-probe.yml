@@ -1,0 +1,3 @@
+- id: llm-deepseek
+  config:
+    baseURL: http://127.0.0.1:8326/v1

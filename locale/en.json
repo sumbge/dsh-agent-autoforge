@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Autoforge Agent",
+    "description": "Mounts the autoforge service as tools: persistent memory, missions, skills and durable forged tools."
+  }
+}

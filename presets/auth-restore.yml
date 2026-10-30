@@ -1,0 +1,7 @@
+# 只为 CLI 验证用：headless 默认关掉托管凭据，这里恢复，让它复用 GUI 已登录的 xdpool 通道。
+- id: credentials
+  disabled: false
+- id: authorization
+  disabled: false
+- id: deepseek-account
+  disabled: false

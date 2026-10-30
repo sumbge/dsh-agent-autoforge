@@ -1,0 +1,5 @@
+# 单次启动叠加层：headless 没有 agent-preset 注册表（也不需要），
+# 这个文件留着做记录，实际验证改用 tui/web。
+# autoforge 的工具由 $DSH_HOME/cordis.patch.yml 的 home 层常驻挂载，
+# 与选不选 preset 无关。
+[]

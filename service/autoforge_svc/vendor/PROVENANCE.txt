@@ -1,0 +1,4 @@
+vendor/tars 与 tars_port.py 于 2026-10-30 从 autoforge-clean/autoforge 整份拷贝到
+autoforge-svc-gw/autoforge_svc。原因：-gw 副本里 skills.py 调用了 .tars_port，
+但该模块与 vendor 树没有随包搬过来，所以 DSH 侧 port_tars_skills 会
+ModuleNotFoundError（实测 2026-10-30）。这里是补上缺失的依赖，行为未改。

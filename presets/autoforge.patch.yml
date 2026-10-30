@@ -1,0 +1,255 @@
+# Bundle patch: 这个包作为 bundle 被选中时插入的东西。
+#
+# 声明 autoforge 这个 agent 预设，并把它的插件行一起放进来 —— 让「模式」列表里
+# 多出 Autoforge 一项，且选中它之后**真的**和 Standard 不一样。
+#
+# 为什么现在能放插件了（旧注释说不能，那个理由已过期）：
+# 早先 `lib/index.js` 的 `apply()` 每被挂一次就 spawn 一个 `python -m autoforge_svc`，
+# 于是 home 层一份 + 预设一份 = 两个进程绑同一个 sqlite，并发写把库弄坏。
+# 现在 `apply()` 按 `${cwd}\0${home}` 去重（`globalThis.__autoforgeClients`），
+# 第二个实例复用第一个 client 并打一条 warn，不会再起第二个进程。
+#
+# 于是这个预设可以选择两种挂法：
+#   A. 只在这里挂（推荐）—— home 层那行删掉，autoforge 工具只属于这个模式
+#   B. 两处都挂 —— 去重兜住，别的模式也能看到 44 个工具
+# 默认按 A 设计；home 层那行的去留是部署决定，不在这个文件里。
+#
+# 顺带修掉的第二个问题：旧的 `plugins: []` 让「选 Autoforge」和「选 Standard」
+# 完全等价 —— 因为 host 平面（`dsh-web-app/cordis.patch.yml`）把所有 tool-* 行
+# 都 `disabled: true` 了，工具一律由预设重新声明。空列表 = 一个工具都没有。
+# 所以下面照 `standard` 的行补齐，再叠上 autoforge 自己的两行。
+
+- insert:
+    - id: preset-autoforge
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: autoforge
+        name: Autoforge
+        description: >-
+          autoforge 模式：工具即数据。模型可以自己写工具，但写出来的要过六道验证
+          （执行 / 鲁棒性 / 对抗 / 触发 / 负例 / 声明）才封成 active，之后靠战绩保持。
+          另带跨会话持久记忆、mission、技能库。工具与状态由本机一个 Python 进程经
+          stdio 提供，模型通道走 DSH 自己的网关。
+        order: 50
+        plugins:
+          # ── 人设 ────────────────────────────────────────────────────────
+          # 这一段是「模式」与「模式」之间唯一真正的差别所在：工具集可以照抄，
+          # 但模型得知道它现在能造工具，以及造出来的东西凭什么被信任。
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |
+                你是 autoforge 模式的智能体。这个模式的核心主张是一句话：
+                **工具即数据，自造的工具必须挣得被调用的权利。**
+
+                你手上有 `autoforge_*` 一族工具，其中最重要的是 `forge_tool`：
+                当一件事你会反复做，而现有工具里没有合手的，就造一个。
+                `forge_tool(need=...)` 用一句话描述需求即可，它会让模型写出实现，
+                然后跑六道检查 —— 执行、鲁棒性、对抗、触发、负例、声明。
+                全过才封成 `active`；没过会带着失败原因重试，最多 3 轮。
+
+                关于这套工具，有几件事你必须知道，否则会误判自己的能力：
+
+                1. **锻造出来的工具是真的代码，跑在沙箱里**，有完整的宿主机文件系统
+                   和出站网络。沙箱限的是爆炸半径（内存/进程/CPU 上限、超时），
+                   不是能力上限。「我没有文件工具」是错的 —— 造一个就有。
+                2. **状态是四段生命周期**：`draft → probation → active → quarantined`，
+                   还有 `retired`。`probation` 立刻可调用；`active` 才算挣到信任。
+                   调用失败率跌破阈值会**自动隔离**，从工具目录里消失，
+                   但 `force=True` 仍可跑。`rehab` 能把它放回 `probation`。
+                3. **不要重复造**。造之前先 `list_tools` 看库里有什么，
+                   `describe_tool(name)` 看一个工具的 schema 和战绩。
+                   同名的 forge 会被拒（"already in this library"）——
+                   要替换就 `evolve_tool`，那是唯一会覆盖的路径。
+                4. **记忆跨会话**。`remember` / `recall` 写的是磁盘上的 sqlite，
+                   重启不丢。该记的东西：路径、偏好、踩过的坑。
+                   `my_history` 能读回「我做过什么」，`my_capabilities` 是测量出来的
+                   自我描述（射程/记忆/自身源码位置），每轮重算，**信它胜过信直觉**。
+                5. **mission 是长任务的载体**。多步任务用 `mission_open` 开一条，
+                   `mission_note` 记进展，`mission_close` 收尾。别用聊天记录当任务状态。
+                6. **技能是程序性记忆**，不是文档。`skill_write` 写一条可复用的做法，
+                   下次 `skill_view` 读回来。技能正文不进上下文，除非你显式加载。
+
+                工作方式：能直接答就直接答，不必为用工具而用工具。
+                该造工具的时候别犹豫 —— 但造完要看它是不是真的过了验证，
+                而不是看到 `ok: true` 就当它可靠。
+
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+
+          # ── autoforge 服务（本预设的 raison d'être）────────────────────
+          # `cwd`/`home` 指向 `-gw` 副本：真 LLM 生成器 + DSH 内置网关。
+          # 原件 `autoforge-svc` 保留 `DSHGatewayClient` + `TemplateGenerator`
+          # 原样不动，供 CLI 与对照实验使用。
+          - id: agent-autoforge-tools
+            name: '@local/dsh-agent-autoforge'
+            config:
+              python: python
+              cwd: 'C:\Users\32535\Desktop\dsh\autoforge-svc-gw'
+              home: 'C:\Users\32535\Desktop\dsh\autoforge-svc-gw\.data'
+              skills: 'C:\Users\32535\AppData\Local\autoforge\skills'
+              # 中断续跑的 journal 在 CLI 那边（%LOCALAPPDATA%\autoforge\runs），
+              # 不在下面这个 home 的 .data 下。不指这里，runs_status 会读一个
+              # 空目录并诚实地报告 0 条——那比缺功能更难查，因为它看起来像答案。
+              runs: 'C:\Users\32535\AppData\Local\autoforge\runs'
+              # forge 一次是六道检查，其中两道各跑一个完整探针会话。
+              # 120s 会在正常的一次 forge 上撞穿；600s 与 CLI 的选择一致。
+              timeoutMs: 600000
+
+          # ── shell ──────────────────────────────────────────────────────
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+
+          # ── filesystem ─────────────────────────────────────────────────
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+
+          # ── background jobs ────────────────────────────────────────────
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+
+          # ── skills ─────────────────────────────────────────────────────
+          # autoforge 的技能库（`skill_write` 写进去的那批）也要能被原生
+          # `skill` 工具看到，否则模型得用两套方式读技能。
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+            config:
+              includeDefaultRoots: false
+              customSkillDirs:
+                - 'C:\Users\32535\AppData\Local\autoforge\skills'
+
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+
+          # ── goals ──────────────────────────────────────────────────────
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+
+          # ── plan mode ──────────────────────────────────────────────────
+          - id: planning
+            name: cordis:group
+            group: true
+            isolate:
+              planMode: true
+            config:
+              - id: plan-mode
+                name: '@deepseek-ai/dsh-plan-mode'
+                config:
+                  section: |
+                    You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
+
+                    Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+
+                    The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+
+                    Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
+
+                    When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+
+          # ── compaction ─────────────────────────────────────────────────
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+
+          # ── delegation ─────────────────────────────────────────────────
+          # 44 个 autoforge 工具已经吃掉了不少上下文预算，子智能体再铺开
+          # 会让每一轮都变贵。保留委派能力，但把深度收到 2（默认 10）。
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+
+              - id: tool-subagent-list-agents
+                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelectionSettings: true
+                  maxDepth: 2
+
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+                  maxDepth: 2
+
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+
+          # ── remaining model-facing rows ────────────────────────────────
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
+
+          - id: tool-plugin-manager
+            name: '@deepseek-ai/dsh-plugin-manager/tools'
+            disabled: !!js "!ctx.get('profileContext')"
+
+          - id: tool-plugin-market
+            name: '@deepseek-ai/dsh-plugin-market/tools'
+            disabled: !!js "!ctx.get('profileContext')"

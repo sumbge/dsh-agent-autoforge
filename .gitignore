@@ -1,0 +1,22 @@
+﻿# Runtime state and caches, not source.
+.data/
+*.db
+*.db-shm
+*.db-wal
+schedule.jsonl
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+*.bak*
+*.orig
+.DS_Store
+Thumbs.db
+
+*.key
+*.pem
+.env
+.env.*

@@ -1,0 +1,15 @@
+# 单次启动叠加层（不动任何已保存 profile）：
+#   1) 插入 desktop 用的 xdpool 模型路由，复用已登录的模型通道；
+#   2) 插入 autoforge 的工具宿主（真实验证时用；正式部署走 home 层 patch）。
+- insert:
+    - id: llm-xdpool
+      name: '@local/dsh-agent-autoforge/xdpool-route'
+      config:
+        distribution: expiry
+    - id: agent-autoforge-tools
+      name: '@local/dsh-agent-autoforge'
+      config:
+        python: python
+        cwd: 'C:\Users\32535\Desktop\dsh\autoforge-svc'
+        home: 'C:\Users\32535\Desktop\dsh\autoforge-svc\.data'
+        timeoutMs: 120000

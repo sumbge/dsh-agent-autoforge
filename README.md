@@ -236,5 +236,7 @@ ctx.tools.register(definition)    output.render 仍是必需项
 
 服务层代码源自 [autoforge](https://github.com/ZhangYangyi03/autoforge)（MIT，Copyright © 2026 Yangyi Zhang），
 本仓库的改动同样以 MIT 发布，见 [LICENSE](LICENSE)。
-`vendor/tars/` 的许可见 `service/autoforge_svc/vendor/PROVENANCE.txt`。
+哪些文件是复制的、哪些是新写的、`vendor/tars/` 的来源，见 [NOTICE](NOTICE)。
+LICENSE 里只有 MIT 原文，没有附加说明——GitHub 的许可证识别器读到额外段落就会
+把仓库标成 `NOASSERTION`，所以说明单独放一个文件。
 插件侧说明见 [PLUGIN.md](PLUGIN.md)。

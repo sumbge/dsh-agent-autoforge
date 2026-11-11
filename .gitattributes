@@ -37,6 +37,7 @@
 *.gitattributes text eol=lf
 *.patch text eol=lf
 /LICENSE text eol=lf
+/NOTICE text eol=lf
 
 # `**/` is required: a pattern containing a slash is anchored to the repository
 # root, so plain `vendor/tars/**` would match nothing here.

@@ -19,20 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-Scope note
-
-The copyright line above is the upstream one, from
-https://github.com/ZhangYangyi03/autoforge (LICENSE, 1,090 bytes), because
-`service/autoforge_svc/` is a copy of that project rather than a fork: the
-same MIT terms and the same holder apply to the copied modules.
-
-Files added or changed by this repository (`lib/`, `presets/`,
-`service/autoforge_svc/service.py`, `service/autoforge_svc/tests/`, and the
-edits listed under "有改动的模块" in README.md) are released under the same
-MIT terms.
-
-`service/autoforge_svc/vendor/tars/` carries its own provenance and licence;
-see `service/autoforge_svc/vendor/PROVENANCE.txt`.

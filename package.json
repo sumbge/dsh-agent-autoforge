@@ -17,7 +17,9 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
-    "PLUGIN.md"
+    "PLUGIN.md",
+    "LICENSE",
+    "NOTICE"
   ],
   "icon": "./icon.svg",
   "dsh": {

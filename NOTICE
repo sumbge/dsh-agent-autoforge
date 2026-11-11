@@ -1,0 +1,35 @@
+Provenance and licensing
+
+This repository is a DSH plugin built on top of
+https://github.com/ZhangYangyi03/autoforge (MIT, Copyright (c) 2026 Yangyi
+Zhang). `service/autoforge_svc/` is a copy of that project rather than a fork
+-- the same MIT terms and the same copyright holder apply to the copied
+modules, which is why LICENSE carries the upstream copyright line unchanged.
+
+The licence file is deliberately left as plain MIT text. An earlier version of
+it appended a scope note; GitHub then reported the repository licence as
+`NOASSERTION` instead of `MIT`, because the licence detector reads the file it
+is given and a file with extra prose stops being the licence it started as.
+The note lives here instead, where it belongs: it is provenance, not terms.
+
+What this repository adds or changes, all under the same MIT terms:
+
+  - `lib/index.js` -- the DSH side: tool mounting, the per-turn brief, the
+    schema projection that keeps 73 tool schemas out of every request in full.
+  - `presets/autoforge.patch.yml` and the other files in `presets/`.
+  - `service/autoforge_svc/service.py` -- the stdio service that exposes the
+    copied modules over a line protocol (76 methods).
+  - `service/autoforge_svc/tests/` and `service/autoforge_svc/tests/regression/`
+    -- the unit tests and the assertion suites.
+  - the modules listed under "有改动的模块" in README.md.
+
+Vendored code with its own provenance:
+
+  - `service/autoforge_svc/vendor/tars/` -- copied from
+    https://github.com/intelligence-indeed/intelligence-indeed. Its own
+    `ORIGIN.txt`, `LICENSE` and `MANIFEST.sha256` describe what it is and let
+    you check the bytes were not edited; see `vendor/PROVENANCE.txt` for how
+    the copy is verified.
+
+Third-party names appear only as facts about where code came from. Nothing
+here is endorsed by, or affiliated with, the projects it was copied from.

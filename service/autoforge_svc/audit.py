@@ -119,12 +119,22 @@ def entry_from_decision(decision: Any, *, resource: str = "",
 
 
 def record(conn: sqlite3.Connection, entry: dict[str, Any],
-           writer: str | None = None) -> dict[str, Any]:
-    """Append one entry to the existing chain. Returns the chain row."""
-    from .. import chaining
+           writer: str | None = None, kind: str | None = None) -> dict[str, Any]:
+    """Append one entry to the existing chain. Returns the chain row.
+
+    `kind` defaults to `KIND` ("policy"), which is right for a verdict about
+    what the agent is *allowed to do*. It is wrong for a receipt about what
+    the agent *did* -- an admitted host, say. Measured 2026-11-04: the egress
+    gate filed `network_allow` under `kind='policy'`, so a reader counting
+    policy refusals got network admissions in the tally, and a test asserting
+    "nothing was refused while the policy was fully permissive" went red on a
+    call that had succeeded. A verdict and a receipt are two different
+    sentences, and the `kind` column is where that difference has to live.
+    """
+    from . import chaining
     payload = dict(entry)
     payload.setdefault("ts", time.time())
-    return chaining.append_event(conn, KIND, payload, writer=writer)
+    return chaining.append_event(conn, kind or KIND, payload, writer=writer)
 
 
 def record_decision(conn: sqlite3.Connection, decision: Any, *,
@@ -175,7 +185,7 @@ def _rows(conn: sqlite3.Connection, since: float | None = None,
     # where the honest answer is "nothing", and the case that produced every
     # first-run support question. Reading a chain that does not exist yet is not
     # an error.
-    from .. import chaining
+    from . import chaining
 
     chaining.ensure_schema(conn)
     sql = ("SELECT id, timestamp, payload, prev_hash, payload_hash FROM forge_events"

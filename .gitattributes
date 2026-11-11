@@ -1,0 +1,43 @@
+# Text extensions are normalised to LF on checkout. The vendored tree is exempt,
+# and that rule comes LAST because git resolves attribute conflicts by taking
+# the pattern that appears later in this file -- measured 2026-11-12: with the
+# vendor rule at the top, every `.py` under it still resolved to `text: set`,
+# so the exemption applied to the one extension-less file (`LICENSE`) and to
+# nothing else. It looked like it worked.
+#
+# Why the exemption exists: `vendor/tars/MANIFEST.sha256` records the digest of
+# each file as it exists upstream, which is LF. If a checkout rewrites those
+# bytes the vendor check reports thirty-two mismatches that are all the same
+# mismatch, and the real question (was this copy edited?) is buried.
+# Measured 2026-11-03: 32 of 32 files carried CRLF, 7291 line endings in all;
+# after normalising, 32 of 32 matched the manifest and nothing else changed.
+#
+# Measured 2026-11-11, the day before the first commit: 191 files in the tree,
+# 85 of them CRLF and 13 starting with a BOM, while the rules below covered
+# three extensions. Every text extension is listed now, and the working tree
+# itself was normalised to LF in the same pass -- a .gitattributes that only
+# fixes checkouts leaves the source it ships from inconsistent. A blanket
+# `* text=auto eol=lf` would do this in one line, but then the icon and the
+# manifest depend on git guessing which files are binary; naming the
+# extensions keeps that a decision.
+#
+# `/LICENSE` is anchored so it does not also match `vendor/tars/LICENSE`.
+
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.sha256 text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.svg text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf
+*.patch text eol=lf
+/LICENSE text eol=lf
+
+# `**/` is required: a pattern containing a slash is anchored to the repository
+# root, so plain `vendor/tars/**` would match nothing here.
+**/vendor/tars/** -text

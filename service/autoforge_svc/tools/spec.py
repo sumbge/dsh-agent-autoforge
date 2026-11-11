@@ -27,6 +27,39 @@ from enum import Enum
 from typing import Any, Callable
 
 
+#: How many calls are remembered per tool.
+#:
+#: Not a round number picked for tidiness: the window has to be long enough to
+#: show a pattern (a tool that works, then degrades, then gets quarantined) and
+#: short enough that the serialised row stays a row. At fifty entries the
+#: `tools.stats` column measures a few kilobytes and one save stays under 3 ms
+#: (measured 2026-11-02 -- see `ToolStats`); at twenty thousand it was one
+#: megabyte and 52 ms per call, for a table nothing ever prunes.
+#:
+#: `schedule.py` set the precedent with `KEEP_HISTORY = 20` for task runs. This
+#: is larger because a tool's history is the evidence a quarantine decision is
+#: reviewed against, and twenty is not enough calls to distinguish "broken" from
+#: "unlucky".
+KEEP_CALL_HISTORY = 50
+
+#: Slots inside that window reserved for failures.
+#:
+#: The auto-quarantine rule is `success_rate < 0.5` or three consecutive
+#: failures (`registry.quarantine_consecutive_failures`), so ten failures is
+#: several distinct episodes -- enough to see whether a repair held. Reserved
+#: rather than counted on arrival, because a plain newest-N window evicts the
+#: one failure the moment the tool starts succeeding again.
+KEEP_CALL_FAILURES = 10
+
+#: Longest error string a history entry keeps.
+#:
+#: Errors here are usually one line from a tool's own `raise`, but a sandbox
+#: timeout carries a traceback and an MCP server can return a stack. Capped at
+#: the same order as the shortest genuinely useful message (a Python exception
+#: line with its location is ~120 characters) with room to spare.
+ERROR_CHARS = 600
+
+
 class ToolState(str, Enum):
     DRAFT = "draft"            # generated, not yet verified
     PROBATION = "probation"    # verified, on trial — callable but flagged
@@ -54,7 +87,38 @@ class TriggerProbe:
 
 @dataclass
 class ToolStats:
-    """Append-only ledger of how a tool behaves in the wild."""
+    """Append-only ledger of how a tool behaves in the wild.
+
+    *Bounded* ledger, though, and the bound is the interesting part.
+
+    `history` used to grow without limit, and every save re-serialised the whole
+    list into the `tools.stats` column. Measured 2026-11-02 against a real
+    sqlite file, one `save_tool`:
+
+        history=   100   2.43 ms      5,629 chars
+        history=  1000   6.20 ms     54,011 chars
+        history=  5000  13.90 ms    268,955 chars
+        history= 20000  52.30 ms  1,074,890 chars
+
+    Linear, so a tool with twenty thousand calls rewrites a megabyte every time
+    it runs -- and the table it rewrites is an append-only ledger that never
+    shrinks.
+
+    Two things must survive the trim, and "keep the newest N" loses both:
+
+    * **The failures.** The entries that explain a quarantine are the oldest
+      thing in the list by the time anyone asks, so a newest-N window deletes
+      exactly the evidence. `KEEP_CALL_FAILURES` slots are reserved for them.
+    * **The count.** `calls`, `successes` and `failures` are counters, not
+      `len(history)`; trimming the list must not rewrite the tally, or
+      `success_rate` becomes "the rate over the last N calls" while still
+      being presented as the tool's record.
+
+    `history_dropped` says how many entries are no longer shown, so a window
+    is never presented as a life. It is a count and not a timestamp because
+    what a reader needs to know is whether the list they are looking at is all
+    of it.
+    """
 
     calls: int = 0
     successes: int = 0
@@ -66,6 +130,21 @@ class ToolStats:
     last_called: float = 0.0
     last_failure: float = 0.0
     history: list[dict[str, Any]] = field(default_factory=list)
+    history_dropped: int = 0
+    #: How many calls the counters no longer include, because `rehab` zeroed them.
+    #:
+    #: `registry.rehab()` zeroes `calls`/`successes`/`failures` so a tool comes
+    #: back on trial with a clean rate, but it deliberately leaves `history`
+    #: alone -- the calls really happened. The result is a tool showing
+    #: `calls: 0` beside six entries, which reads as corruption unless something
+    #: says why. Measured 2026-11-02: `fake_file_size` sat in exactly that state
+    #: on the live database, and the only way to explain it was to read
+    #: `registry.rehab`. `rehab` now adds the old count here before zeroing, so
+    #: `calls + calls_not_in_counters` is the true lifetime call count.
+    #:
+    #: A scalar and not a synthetic history entry, because a marker inside
+    #: `history` would be counted, sorted and trimmed like a call it never was.
+    calls_not_in_counters: int = 0
 
     @property
     def success_rate(self) -> float:
@@ -86,9 +165,65 @@ class ToolStats:
             self.failures += 1
             self.consecutive_failures += 1
             self.last_failure = time.time()
+        # An error string is untrusted text from a tool (or from a sandbox, or
+        # from an MCP server). Unbounded, one pathological failure could put a
+        # megabyte of traceback into every future save of this tool.
+        if error is not None and len(error) > ERROR_CHARS:
+            error = error[:ERROR_CHARS]
         self.history.append(
             {"t": self.last_called, "ok": ok, "error": error}
         )
+        if len(self.history) > KEEP_CALL_HISTORY:
+            self._trim_history()
+
+    def _trim_history(self) -> None:
+        """Keep the newest window, and force the newest failures into it.
+
+        The naive rule -- newest N by position -- loses the evidence. A tool
+        that fails once and then succeeds five hundred times has one
+        interesting entry and it is the oldest one, so a positional window
+        deletes exactly the call that explains a quarantine.
+
+        The rule here: take the newest `KEEP_CALL_HISTORY` entries, then make
+        sure the newest `KEEP_CALL_FAILURES` failures are among them, trading
+        the oldest *success* for each one that is missing. A failure never
+        evicts a failure, so the window cannot fill with repeated copies of the
+        same error while older distinct ones fall out.
+
+        Written as a repair rather than as an apportionment ("ten slots for
+        failures, forty for successes") because an apportionment is a ceiling
+        read backwards: a tool that has failed sixty times in a row would keep
+        only ten of them and report forty phantom drops, throwing away history
+        it had no reason to throw away.
+        """
+        if len(self.history) <= KEEP_CALL_HISTORY:
+            return
+        start = len(self.history) - KEEP_CALL_HISTORY
+        keep = self.history[start:]
+        fail_at = [i for i, e in enumerate(self.history) if not e["ok"]]
+        # Failures older than the window that are still worth forcing back in.
+        # They can only be missing when the window is not already all
+        # failures: an entry at `i < start` is older than everything in `keep`,
+        # so if `keep` were entirely failures they would already be the older
+        # sort -- and the newest ten would be inside the window regardless.
+        wanted = [i for i in fail_at[-KEEP_CALL_FAILURES:] if i < start]
+        if not wanted:
+            self.history_dropped += start
+            self.history = keep
+            return
+        out: list[dict[str, Any]] = []
+        queue = [self.history[i] for i in wanted]
+        for entry in keep:
+            if queue and entry["ok"]:
+                out.append(queue.pop(0))
+            else:
+                out.append(entry)
+        # A failure that found no success to replace stays out: the window is
+        # full of newer failures, which is the case this repair exists to
+        # preserve, not to undo.
+        out.sort(key=lambda e: e["t"])
+        self.history_dropped += len(self.history) - len(out)
+        self.history = out
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

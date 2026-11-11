@@ -26,6 +26,7 @@ import tempfile
 import textwrap
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 #: Windows: hide the child's console. CREATE_NO_WINDOW, not DETACHED_PROCESS.
@@ -231,6 +232,15 @@ class Sandbox:
         # flashes a console window. Measured 2026-09-16; see tests/test_store.py
         # for the pin.
         "APPDATA", "LOCALAPPDATA",
+        # Where installed programs live. Left out, `nvidia-smi` starts and then
+        # exits 255 with `Failed to initialize NVML: Unknown Error` -- it loads
+        # the vendor DLLs through ProgramFiles, and NVML reports a missing path
+        # as an unknown hardware error rather than as a missing variable. A/B
+        # measured 2026-11-02: the stripped environment fails, adding this one
+        # name back makes it answer; `ProgramW6432` (same value) also works,
+        # `ProgramFiles(x86)`/`ProgramData`/`SystemDrive` do not. The old note in
+        # the report called this a platform limitation -- it was this list.
+        "ProgramFiles", "ProgramW6432",
     )
     runner: Callable[[str, str, dict[str, Any]], SandboxResult] | None = None
     #: Asked while a child is running: ``True`` means kill it now and report
@@ -269,8 +279,23 @@ class Sandbox:
         for the agent process (a git-bash `ps`, say) can be unreachable from
         inside the sandbox. Everything the prompt claims about this host is
         built from *this* mapping, never from `os.environ`.
+
+        Dropping a name is not neutral: a program can start, find its own
+        executable, and still fail because the *variable* was the thing it
+        needed. `nvidia-smi` did exactly that without `ProgramFiles` -- exit
+        255 and `Failed to initialize NVML: Unknown Error`, which reads like a
+        hardware fault. Adding a name here is cheap; explaining that error is
+        not. See the comment in `env_allow`.
         """
-        env = {k: v for k, v in os.environ.items() if k in self.env_allow}
+        # Case-insensitively, because the names above are written in the shape
+        # a person writes them and Windows stores them upper-cased: a literal
+        # `k in self.env_allow` silently dropped `ProgramFiles`, and the only
+        # symptom was `nvidia-smi` exiting 255 with a NVML hardware error.
+        # Measured 2026-11-02. An allow-list that is quietly stricter than it
+        # reads is the same defect this project keeps finding; the comparison
+        # belongs in one place, spelled out.
+        wanted = {n.lower() for n in self.env_allow}
+        env = {k: v for k, v in os.environ.items() if k.lower() in wanted}
         env.setdefault("PYTHONIOENCODING", "utf-8")
         return env
 
@@ -488,20 +513,78 @@ class Sandbox:
         read it back; resolve a hostname) so the report is evidence rather than
         an assertion. Callers that want speed over proof leave it off.
         """
+        # Report the environment the child will actually see, not the length of
+        # the allow-list. Those two numbers disagree on any host where the
+        # agent's own process does not define every allow-listed name (`HOME`,
+        # `LANG`, `LC_ALL`, `PYTHONPATH` are routinely absent on Windows), and
+        # a child that counts its own `os.environ` then gets a different answer
+        # from the one this report promised. Measured 2026-11-01 on this host:
+        # `env_allow` was 13 names, `effective_env()` was 10 -- the brief said
+        # 13 and every forged tool that measured got 10, which reads as the
+        # sandbox having dropped something it never had. State both, so the
+        # smaller number is explained rather than contradicted.
+        env_effective = self.effective_env()
+        # Same case-folding as `effective_env`, for the same reason. Written the
+        # obvious way (`n not in env_effective`) this said `ProgramFiles` and
+        # `ProgramW6432` were "allow-listed but unset here" while the child had
+        # them as `PROGRAMFILES`/`PROGRAMW6432`, and counted those two as names
+        # the sandbox injected. The count still came out right by luck; the two
+        # lists naming the same variables on both sides of the ledger would not
+        # have stayed lucky. Measured 2026-11-02.
+        present = {k.lower() for k in env_effective}
+        allowed = {n.lower() for n in self.env_allow}
+        injected = tuple(k for k in env_effective if k.lower() not in allowed)
+        absent = tuple(n for n in self.env_allow if n.lower() not in present)
+        defined = len(env_effective) - len(injected)
+        env_line = (f"{len(env_effective)} vars reach the child "
+                    f"({defined} of {len(self.env_allow)} allow-listed names "
+                    "the parent defines"
+                    + (f", +{', '.join(injected)}" if injected else "")
+                    + "), not the full environment")
+        if absent:
+            env_line += f"; allow-listed but unset here: {', '.join(absent)}"
         facts: dict[str, Any] = {
             "host": "this machine — the sandbox is a subprocess of the agent",
             "isolated_from_host": False,
             "filesystem": "read-write, whole host (not confined to cwd)",
             "network": "outbound — DNS and sockets",
             "cwd": "a fresh empty temp dir, per call",
-            "env": f"{len(self.env_allow)} allow-listed vars, not the full environment",
+            "env": env_line,
+            "env_names_present": sorted(env_effective),
+            "env_names_absent": list(absent),
             "restrict_builtins": self.restrict_builtins,
             "timeout_s": self.timeout,
             "contained": self._containment_line(),
+            # Where the answering code lives. The persona promises that
+            # `my_capabilities` reports "射程/记忆/自身源码位置". For two rounds
+            # it reported the first two and not the third: a promise in the
+            # persona that nothing in the code was checking, which is the same
+            # defect class as every other one in this file. Read from the
+            # module that knows, so a moved install moves the answer with it.
+            "source": self._source_line(),
         }
         if probe:
             facts["probe"] = self._probe()
         return facts
+
+    @staticmethod
+    def _source_line() -> str:
+        """Where this service's own code is, so the answer survives a move.
+
+        `__file__` of the module that computes reach, plus its mtime. The mtime
+        is the part that matters in practice: the question this answers is not
+        "where is the code" but "is the code I am reading the code that is
+        running", and a timestamp compared against `Get-CimInstance
+        Win32_Process CreationDate` settles that in one look.
+        """
+        import datetime
+        here = Path(__file__).resolve()
+        try:
+            stamp = datetime.datetime.fromtimestamp(here.stat().st_mtime)
+            when = stamp.strftime("%Y-%m-%d %H:%M:%S")
+        except OSError:
+            when = "mtime unavailable"
+        return f"{here} (mtime {when}); service package {here.parent.parent.name}"
 
     def _containment_line(self) -> str:
         """What the kernel is holding the run to, said in the same breath as reach.
@@ -523,6 +606,50 @@ class Sandbox:
                     "kill-on-close reaches the whole tree")
         return "rlimits (address space, CPU, file size, open files)"
 
+    @staticmethod
+    def _confirm_write(child_detail: Any, parent_tempdir: str, name: str,
+                       *, exists: Any = None) -> dict[str, Any]:
+        """Which of the two candidate paths this process can actually see.
+
+        Extracted from `_probe` because it could not be observed where it was.
+        On this host the child's `tempfile.gettempdir()` and this process's are
+        the same string, so the two branches of the old inline code -- "the
+        path the child named" and "the path I would have chosen" -- produced the
+        identical answer, and two mutants survived for exactly that reason: one
+        that hard-coded `confirmed = True`, one that reported `mine` instead of
+        what it found. Neither could be seen, because on this machine there was
+        nothing to see. `exists` is injectable for the same reason: the
+        interesting case is the one where they DISAGREE, and that case has to be
+        constructible rather than waited for.
+
+        The disagreement is not hypothetical, but the reason once written here was
+        wrong and is corrected: `TEMP` and `TMP` ARE in `env_allow`, so
+        `effective_env()` does not drop them. Four constructions were measured on
+        2026-11-08 -- as shipped, both names removed, TEMP pointed at a missing
+        directory, TEMP pointed at a real second directory -- and the parent and the
+        child answered the same path in all four. The mechanism that really
+        separates them is `isolate=True`, where the child is not on this filesystem
+        at all and answers /tmp while this process answers a Windows path; that
+        route could not be exercised here (`wsl -l -q` returns rc=0 with an empty
+        distro list). A child that writes into its own directory and reports
+        success proves it could write; it does not prove the write landed anywhere
+        this process can look -- and under isolation it landed somewhere this
+        process cannot look at all.
+        """
+        probe = exists if exists is not None else os.path.exists
+        candidates: list[str] = []
+        if isinstance(child_detail, str) and child_detail:
+            candidates.append(child_detail)
+        mine = os.path.join(parent_tempdir, name)
+        if os.path.abspath(mine) not in [os.path.abspath(c) for c in candidates]:
+            candidates.append(mine)
+        found = next((c for c in candidates if probe(c)), None)
+        return {
+            "candidates": candidates,
+            "found": found,
+            "confirmed": bool(found),
+        }
+
     def _probe(self) -> dict[str, Any]:
         """A real round-trip, so `reach` can be checked instead of believed.
 
@@ -530,15 +657,19 @@ class Sandbox:
         prove nothing about escaping it — and it is written into the CHILD's
         temp dir, resolved inside the child.
 
-        That last part is the fix for a self-report that contradicted itself.
-        `effective_env()` drops TMP/TEMP unless they are allow-listed, so the
-        child can resolve a different temp dir from the one this process
-        resolved at import time (measured on this host: here `tempfile` gives
-        C:\Temp, the child's gives one under LOCALAPPDATA). Handing the child
-        the parent's path made it write to its own directory, report ok, and
-        leave this process looking at an empty path in another directory — an
-        answer that said "filesystem OK" and "the file is not there" in the
-        same breath.
+        That last part is the fix for a self-report that contradicted itself:
+        handing the child the parent's path made it write to its own directory,
+        report ok, and leave this process looking at an empty path in another
+        directory -- an answer that said "filesystem OK" and "the file is not
+        there" in the same breath.
+
+        The cause once named here -- `effective_env()` dropping TMP/TEMP -- is not
+        the cause: both names are in `env_allow`, and four environment
+        constructions on 2026-11-08 all left the two processes agreeing. The route
+        that does separate them is `isolate=True` (a Linux child answers /tmp),
+        which this host cannot run: `wsl -l -q` lists no distribution. So the
+        child's own reported path is used first because the isolation route exists,
+        not because a measured environment difference exists on Windows.
 
         And the claim is confirmed from OUT HERE. A child that deletes its own
         file and reports success proves it could write; it does not prove the
@@ -548,7 +679,7 @@ class Sandbox:
         name = ".autoforge_reach_probe"
         r = self.run(
             "def probe(name):\n"
-            "    import os, socket, tempfile\n"
+            "    import os, socket, tempfile, ssl, uuid\n"
             "    out = {}\n"
             "    home = os.path.join(tempfile.gettempdir(), name)\n"
             "    try:\n"
@@ -558,8 +689,35 @@ class Sandbox:
             "        out['host_filesystem'] = {'ok': back == 'reach', 'detail': home}\n"
             "    except Exception as e:\n"
             "        out['host_filesystem'] = {'ok': False, 'detail': type(e).__name__ + ': ' + str(e)}\n"
+            "    # A resolution is not evidence of a network on a host whose DNS is\n"
+            "    # answered by a wildcard interceptor: measured here, a name that\n"
+            "    # cannot exist still resolves to 198.18.0.x. So resolve a name that\n"
+            "    # NOBODY could have registered and see whether the answer is a lie.\n"
             "    try:\n"
-            "        out['network'] = {'ok': True, 'detail': socket.gethostbyname('pypi.org')}\n"
+            "        bogus = 'autoforge-probe-' + uuid.uuid4().hex + '.invalid'\n"
+            "        socket.gethostbyname(bogus)\n"
+            "        dns_intercepted = True\n"
+            "    except Exception:\n"
+            "        dns_intercepted = False\n"
+            "    out['dns_intercepted'] = dns_intercepted\n"
+            "    try:\n"
+            "        ip = socket.gethostbyname('pypi.org')\n"
+            "        out['dns'] = {'ok': True, 'detail': ip,\n"
+            "                      'evidence': 'intercepted' if dns_intercepted else 'resolved'}\n"
+            "    except Exception as e:\n"
+            "        out['dns'] = {'ok': False, 'detail': type(e).__name__ + ': ' + str(e)}\n"
+            "    # The claim that survives an intercepted resolver: a TCP connection\n"
+            "    # and a real certificate carrying the expected name.\n"
+            "    try:\n"
+            "        ctx = ssl.create_default_context()\n"
+            "        with socket.create_connection(('pypi.org', 443), timeout=8) as sock:\n"
+            "            with ctx.wrap_socket(sock, server_hostname='pypi.org') as tls:\n"
+            "                cert = tls.getpeercert()\n"
+            "                ver = tls.version()\n"
+            "        names = [v for k, v in cert.get('subjectAltName', ()) if k == 'DNS']\n"
+            "        out['network'] = {'ok': 'pypi.org' in names,\n"
+            "                          'detail': str(ver) + ', SAN ' + ', '.join(names[:3]),\n"
+            "                          'evidence': 'tcp+tls certificate'}\n"
             "    except Exception as e:\n"
             "        out['network'] = {'ok': False, 'detail': type(e).__name__ + ': ' + str(e)}\n"
             "    return out\n",
@@ -571,25 +729,21 @@ class Sandbox:
         out = r.output if isinstance(r.output, dict) else {"error": f"unexpected {r.output!r}"}
 
         # Confirm the write from the parent, in every temp dir either side
-        # could have meant, and clean up whatever is found.
+        # could have meant, and clean up whatever is found. The decision
+        # itself lives in `_confirm_write`, where the disagreement between
+        # the two temp dirs can be constructed instead of waited for.
         child_detail = (out.get("host_filesystem") or {}).get("detail") \
             if isinstance(out.get("host_filesystem"), dict) else None
-        candidates: list[str] = []
-        if isinstance(child_detail, str) and child_detail:
-            candidates.append(child_detail)
-        mine = os.path.join(tempfile.gettempdir(), name)
-        if os.path.abspath(mine) not in [os.path.abspath(c) for c in candidates]:
-            candidates.append(mine)
-        found = next((c for c in candidates if os.path.exists(c)), None)
-        out["host_filesystem_confirmed_by_parent"] = bool(found)
-        out["host_filesystem_seen_at"] = found
-        for cand in candidates:
+        built = self._confirm_write(child_detail, tempfile.gettempdir(), name)
+        out["host_filesystem_confirmed_by_parent"] = built["confirmed"]
+        out["host_filesystem_seen_at"] = built["found"]
+        for cand in built["candidates"]:
             try:
                 if os.path.exists(cand):
                     os.remove(cand)
             except OSError:
                 pass
-        if found is None:
+        if not built["confirmed"]:
             out["host_filesystem_note"] = (
                 "the child reported a successful write but no file was visible "
                 "from this process -- treat that report as unproven")

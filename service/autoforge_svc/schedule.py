@@ -42,6 +42,8 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from .store import home_dir
 from typing import Any
 
 #: How many runs of a repeating task are remembered as history.
@@ -55,10 +57,16 @@ class ScheduleError(RuntimeError):
 
 
 def default_schedule_path() -> Path:
-    """`$AUTOFORGE_HOME/schedule.jsonl`, alongside the other durable state."""
-    home = os.environ.get("AUTOFORGE_HOME")
-    base = Path(home) if home else Path.home() / ".autoforge"
-    return base / "schedule.jsonl"
+    """`$AUTOFORGE_HOME/schedule.jsonl`, alongside the other durable state.
+
+    The docstring said "alongside the other durable state" and the code did not
+    do it: the fallback was `Path.home() / ".autoforge"` while the store fell
+    back to `$LOCALAPPDATA/autoforge`. Measured 2026-11-05 -- with no
+    `AUTOFORGE_HOME` set, the two readers name different files, and both files
+    existed on this machine (868 bytes with one task, 2,667 bytes with four).
+    Asking the store is the only way "alongside" stays true.
+    """
+    return Path(home_dir()) / "schedule.jsonl"
 
 
 def parse_when(when: str | float | int, now: float | None = None) -> float:
@@ -341,7 +349,16 @@ def system_task_command(interval_minutes: int = 30, name: str = "autoforge-tick"
     persistent to the machine. `install_system_task` is the thing that runs it.
     """
     plat = (platform or sys.platform).lower()
-    interval = max(1, int(interval_minutes))
+    # Not `max(1, int(interval_minutes))`. That clamped 0 and -5 up to 1 and
+    # then reported success in terms of the number it was given, so a caller
+    # asking for "every 0 minutes" was told "every 0 minute(s)" while the OS
+    # was told 1. Measured 2026-11-06: three real Windows tasks registered that
+    # way from a probe that only meant to read a shape. An interval that cannot
+    # be honoured is a refusal, not an adjustment.
+    interval = int(interval_minutes)
+    if interval < 1:
+        raise ScheduleError(
+            f"a wake interval must be at least 1 minute, got {interval_minutes!r}")
     argv = wake_command(interval, script)
 
     if plat.startswith("win"):

@@ -47,6 +47,10 @@ CAPABILITY_FREEDOM: dict[str, str] = {
 _SCOPE_EXTRA: dict[str, frozenset[str]] = {
     "read_only": frozenset({"filesystem_read"}),
     "local_write": frozenset({"filesystem_read"}),
+    # Must exist here as well as in `SCOPE_ALLOWANCES`: a scope missing from
+    # this dict is not an error, it just silently loses the reading capability
+    # -- and `declared_capabilities` is what the gate consults.
+    "destructive": frozenset({"filesystem_read"}),
     "network": frozenset({"filesystem_read"}),
     "system": frozenset({"filesystem_read"}),
     "privileged": frozenset({"filesystem_read"}),
@@ -79,12 +83,21 @@ def _normalise_scope(effect_signature: str) -> str:
 
     Mirrors `validity.declared_scope`, which reads the same field off a
     ToolSpec. Done here rather than by calling it with a stand-in object so the
-    gate has no dependency on the tool being a real spec.
-    """
-    from ..forge.validity import SCOPE_ALLOWANCES          # local: avoid cycle
+    gate has no dependency on the tool being a real spec -- and now literally,
+    by calling `validity.scope_of_signature`, which also takes a bare string.
 
-    sig = (effect_signature or "").strip().lower()
-    return sig if sig in SCOPE_ALLOWANCES else "undeclared"
+    Until 2026-11-04 this function accepted only the seven fixed scope names
+    and answered `undeclared` for everything else. `forge/generator.py:375`
+    teaches the model to write `reads:<what>` / `writes:<what>`, so every
+    honestly-declared tool arrived here as `undeclared`, which
+    `declared_capabilities` reads as all eight capabilities -- and
+    `roles.py`'s critic, whose whole allowance is `filesystem_read`, refused
+    every one of them. The two halves are now the same function, so the gate
+    and the contract cannot drift apart again.
+    """
+    from ..forge.validity import scope_of_signature          # local: avoid cycle
+
+    return scope_of_signature(effect_signature) or "undeclared"
 
 
 def required_freedoms(effect_signature: str) -> tuple[str, ...]:

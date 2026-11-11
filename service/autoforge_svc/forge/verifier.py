@@ -19,6 +19,7 @@ own tools before trusting them.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -195,6 +196,82 @@ def _strip_quoted(text: str) -> str:
     return "".join(out)
 
 
+def _expect_renderings(expect: str) -> list[tuple[str, str]]:
+    """The several shapes an expected answer is allowed to appear in.
+
+    `sample_expect` is documented with JSON examples (`{"bytes": 92}`) because
+    the tool contract is JSON, but the text this gate sees is whatever the
+    sandbox chose to stringify: `tool_define` reports a Python `repr`
+    (`{'bytes': 92}`) and a tool returning a JSON string reports JSON. Comparing
+    the raw bytes makes the *rendering* part of the contract, and a tool that
+    computed exactly the right number fails because of a quote character.
+
+    Measured 2026-11-01: `file_facts` answered `{'bytes': 92, 'lines': 8, ...}`
+    for the declared call and `sample_expect='"bytes": 92'` was reported as
+    "answer does not contain". The number was right; the punctuation was
+    Python's. Rather than teaching every caller which internal serialiser it is
+    talking to, both sides are normalised: single/double quotes, spacing around
+    `:` and `,`, and the surrounding braces all stop mattering.
+
+    The normalisation is deliberately narrow -- quote style, insignificant
+    whitespace, and json-ish value spelling. It does not drop content, so it
+    cannot turn a wrong answer into a right one.
+    """
+    raw = str(expect).strip()
+    variants: dict[str, str] = {"raw": raw}
+    if not raw:
+        return list(variants.items())
+
+    def _loose(text: str) -> str:
+        # Quote characters and the whitespace JSON allows around punctuation
+        # carry no meaning; `True`/`False`/`None` vs `true`/`false`/`null` is
+        # the one place Python and JSON spell a value differently.
+        out = text.replace('"', "'")
+        # Collapse runs of spaces *first*: replacing one "': '" pair at a time
+        # handled the single-space spelling and left `'bytes':   92` failing,
+        # which is the same defect this function exists to remove.
+        out = re.sub(r"\s+", " ", out)
+        out = out.replace("' ", "'").replace(" '", "'")
+        out = out.replace(": ", ":").replace(" :", ":")
+        out = out.replace(", ", ",").replace(" ,", ",")
+        for py, js in (("True", "true"), ("False", "false"), ("None", "null")):
+            out = out.replace(py, js).replace(py.lower(), js)
+        return out
+
+    variants["loose"] = _loose(raw)
+    # A bare `key: value` fragment (the common declaration) has to match inside
+    # a braced body, where the closing brace sits directly after the value.
+    if variants["loose"].startswith("'") or ":" in variants["loose"]:
+        variants["loose_no_brace"] = variants["loose"].strip("{}")
+    # The JSON spelling of a fragment that was written Python-style, and the
+    # reverse, so a tool answering in either serialiser is judged the same.
+    variants["jsony"] = _loose(raw).replace("'", '"')
+    variants["pyish"] = variants["jsony"].replace('"', "'")
+    return list(dict.fromkeys(variants.items()))
+
+
+def _expect_matches(expect: str, output: str) -> tuple[bool, list[str]]:
+    """Does `output` contain `expect`, in any rendering either side may use?"""
+    renderings = _expect_renderings(expect)
+    hay = output
+    hay_loose = None
+    tried: list[str] = []
+    for label, needle in renderings:
+        tried.append(label)
+        if not needle:
+            continue
+        if needle in hay:
+            return True, tried
+        if label != "raw":
+            if hay_loose is None:
+                hay_loose = (hay.replace('"', "'").replace(": ", ":").replace(", ", ",")
+                             .replace("True", "true").replace("False", "false")
+                             .replace("None", "null"))
+            if needle in hay_loose:
+                return True, tried
+    return False, tried
+
+
 class ToolVerifier:
     """Runs the full check battery against a freshly forged tool.
 
@@ -340,13 +417,15 @@ class ToolVerifier:
                     f"rejected its own valid sample call {args!r}: {output[:200]}",
                     evidence,
                 )
-            if spec.sample_expect and spec.sample_expect not in output:
-                return CheckResult(
-                    "execution", False,
-                    f"answer for {args!r} does not contain {spec.sample_expect!r}: "
-                    f"{output[:200]}",
-                    evidence,
-                )
+            if spec.sample_expect:
+                matched, tried = _expect_matches(spec.sample_expect, output)
+                if not matched:
+                    return CheckResult(
+                        "execution", False,
+                        f"answer for {args!r} does not contain {spec.sample_expect!r} "
+                        f"in any of its {len(tried)} renderings: {output[:200]}",
+                        evidence,
+                    )
             # Only now, having been right about something, does the tool earn a
             # look at whether it is also total. The synthetic probe is run too,
             # and reported only as a warning: failing on invented garbage is a
@@ -759,21 +838,29 @@ class ToolVerifier:
         if self.run_claim_check and spec.code:
             claim = check_claim(spec, self.sandbox, sample_args=sample_args)
             self.claim_report = claim
-            # `applicable=False` is a legitimate N/A, not a gap: this tool
-            # declares no rail (no enum, no boolean, no prediction column), so
-            # there is nothing whose influence could be tested. Treating that as
-            # `unprobed` was wrong and it sealed nothing -- it failed every
-            # correct single-argument tool, which is the opposite defect. The
-            # three-state distinction is for checks that SHOULD have judged and
-            # did not; a check with nothing in its remit stays a pass and says so
-            # in its detail ("not applicable (no rail declared)").
+            # Three outcomes now, not two -- `claimgate` distinguishes them
+            # itself, and this stanza reads the distinction rather than
+            # re-deciding it:
             #
-            # A rail that IS declared and cannot be exercised is a different
-            # matter, and `claimgate` already answers it: it sets `applicable`
-            # True and `passed` False with a `un_probed` finding, which lands
-            # here as an ordinary failure.
+            #   applicable & passed      a rail or a difference probe ran and held
+            #   unprobed                 the gate had something to perturb and
+            #                            could not (no sample value, unreadable
+            #                            probe target, probe call failed):
+            #                            a hole in the evidence, so not a pass
+            #   neither                  genuinely nothing in its remit
+            #
+            # The middle case used to be folded into the last one. Its note
+            # (`un_probed`) was set, but `applicable` stayed False, so this code
+            # printed "not applicable (no rail declared)" and counted a pass.
+            # Measured 2026-10-31: a tool declaring only `path: str` returned a
+            # fabricated byte count for a real file and the claim gate
+            # contributed a green check to the battery. `_no_rail_findings` now
+            # gives such a tool two same-size files with different contents and
+            # requires the answer to move, so the honest case is judged rather
+            # than excused; what remains unprobed is reported as unprobed.
             checks.append(CheckResult(
-                "claim", bool(claim.passed), claim.summary(), claim.to_dict()))
+                "claim", bool(claim.passed), claim.summary(), claim.to_dict(),
+                unprobed=bool(getattr(claim, "unprobed", False))))
         else:
             self.claim_report = None
 

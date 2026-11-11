@@ -317,7 +317,12 @@ class SkillLibrary:
         self.dirs = dirs if dirs is not None else default_skill_dirs(cwd=cwd)
         self._skills: dict[str, Skill] = {}
         self.errors: list[str] = []       # unreadable files, with the reason
-        self.shadowed: list[tuple[str, str]] = []   # (name, winning path)
+        #: (name, winning path, ignored path). Three parts, because the two
+        #: paths answer two different questions -- "which one am I actually
+        #: reading" and "which file is being ignored" -- and the first version
+        #: kept only the winner, so a report saying "skill_errors names both
+        #: copies" was promising something this could not deliver.
+        self.shadowed: list[tuple[str, str, str]] = []
 
     # -- reading ----------------------------------------------------------
     def dirs_present(self) -> list[tuple[str, str]]:
@@ -350,7 +355,7 @@ class SkillLibrary:
                     continue
                 prior = found.get(skill.name)
                 if prior is not None:
-                    self.shadowed.append((skill.name, prior.path))
+                    self.shadowed.append((skill.name, prior.path, skill.path))
                     continue
                 found[skill.name] = skill
 
@@ -392,7 +397,24 @@ class SkillLibrary:
     def _read(self, path: Path, source: str) -> Skill:
         text = path.read_text(encoding="utf-8")
         meta, body = split_frontmatter(text, origin=str(path))
-        name = (meta.get("name") or path.stem).strip()
+        name = (meta.get("name") or "").strip()
+        if not name:
+            # A package's directory is its name.  `path.stem` for `SKILL.md` is
+            # literally "SKILL", which `valid_name` rejects (upper case), so a
+            # package whose frontmatter did not repeat its own name did not get
+            # a wrong name -- it got *no* name, landed in `errors`, and vanished
+            # from the listing.  Meanwhile `skill_view` served that same file by
+            # its directory name, so the two halves of the surface disagreed
+            # about whether the file existed.  Measured 2026-11-06 on
+            # `alpha/undeclared_pkg/SKILL.md`: the listing showed one skill of
+            # three on disk, and `skill_view("undeclared_pkg")` answered fine.
+            #
+            # A declared `name:` still wins, and it should: that is the only way
+            # a package can be called something other than its directory.  The
+            # old rule honoured it here while `skill_view` ignored it -- the
+            # other half of the same split.
+            name = (path.parent.name if path.name.lower() == SKILL_INDEX_NAME.lower()
+                    else path.stem)
         if not valid_name(name):
             raise SkillError(
                 f"skill {path} has an unusable name {name!r}: use lower-case "
@@ -594,7 +616,7 @@ class SkillLibrary:
             "most_used": [s.name for s in skills[:3] if s.loads],
             "dirs": [d for _, d in self.dirs_present()],
             "unreadable": list(self.errors),
-            "shadowed": [name for name, _ in self.shadowed],
+            "shadowed": [row[0] for row in self.shadowed],
             "backend": "markdown on disk; usage in the store",
         }
 

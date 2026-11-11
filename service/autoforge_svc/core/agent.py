@@ -73,6 +73,15 @@ class AgentResult:
     # done" and "a person stopped it" are different facts, and a report that
     # blurs them credits the agent with a decision it did not make.
     stopped_by_operator: bool = False
+    #: True only when the loop returned because it ran out of turns. This field
+    #: exists so that a caller does not have to read the content string to find
+    #: out. Before it, the cap announced itself only in prose --
+    #: `"(turn cap of 12 reached before completion)"` -- and a caller that kept
+    #: `content` alone could not tell that sentence from an answer (measured
+    #: 2026-11-04: a capped scheduled run was filed as `ok: True`,
+    #: `failures: 0`). Reading the words was the only way to know, so the
+    #: words were the contract, and prose is not a contract.
+    hit_turn_cap: bool = False
 
     @property
     def used_tools(self) -> bool:
@@ -461,6 +470,46 @@ class Agent:
         except Exception:                     # noqa: BLE001 - reads as "no"
             return False
 
+    # -- role ----------------------------------------------------------
+    def apply_role(self, brief: str, role: str = "") -> None:
+        """Take the brief a spawner wrote for this child, and mean it.
+
+        `autonomy/spawn.py` has called `getattr(child, "apply_role", None)` since
+        the day it was written, and this class never had the attribute, so the
+        hook was never taken: a `SpawnRecord` would honestly report
+        `brief_chars: 265` while not one of those characters reached the model.
+        `roles.py` puts the hazard in a sentence -- "A hint the child never sees
+        is a note to the file" -- and the code beside it was the note.
+
+        Two things this has to get right, both measured rather than assumed:
+
+        * **The base prompt survives.** The brief is appended to whatever
+          `system_prompt` the child was built with, kept separately in
+          `_base_system_prompt`, so a second call replaces the role section
+          instead of growing a stack of them. A teammate asked to take on a new
+          role should have one role, not two.
+        * **An empty brief changes nothing.** `spawn()` only calls this when it
+          has something to say, but the guard belongs here: silently appending
+          an empty heading would put a lie in the prompt about a role that was
+          never described.
+
+        `role` is only used for the heading. The gate that enforces what a role
+        may do lives in `autonomy/roles.py` and is applied through
+        `ToolRegistry.scoped`, which is why a brief that says "you may only
+        read" and a registry that permits writes would be a contradiction this
+        method cannot create and cannot fix.
+        """
+        text = (brief or "").strip()
+        if not text:
+            return
+        self._base_system_prompt = getattr(self, "_base_system_prompt", self.system_prompt)
+        label = (role or "").strip()
+        heading = f"## Your role: {label}" if label else "## Your role"
+        self.system_prompt = f"{self._base_system_prompt}\n\n{heading}\n{text}"
+        # Recorded so the verification harness can tell a child whose brief was
+        # applied from one whose brief only travelled as far as `SpawnRecord`.
+        self._role = (label, text)
+
     def run(self, task: str, history: Sequence[Message] | None = None) -> AgentResult:
         """Run to a result, telling the channel that a run is live throughout.
 
@@ -497,6 +546,12 @@ class Agent:
                 return AgentResult(
                     f"(turn cap of {self.max_turns} reached before completion)",
                     msgs, turn - 1, used,
+                    # The sentence above is for a reader. This is for a caller:
+                    # the cap is the one ending where the run did not decide to
+                    # stop, and a caller that only sees the sentence cannot tell
+                    # it from an answer.
+                    termination_reason=f"turn cap of {self.max_turns} reached",
+                    hit_turn_cap=True,
                 )
             # Before the model is asked: the cheapest place to find out the
             # task just changed.

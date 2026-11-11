@@ -274,8 +274,71 @@ def _check(ok: bool, good: str, bad: str) -> str:
     return good if ok else bad
 
 
+def _vendor_sentence(check: dict) -> str:
+    """One honest sentence about the vendor tree.
+
+    Kept as a function so the wording lives in one place and the test can call
+    it directly instead of pattern-matching prose out of a list.
+    """
+    if not check.get("checked"):
+        return "none listed (MANIFEST.sha256 missing)"
+    matched = int(check["checked"]) - len(check.get("mismatched") or [])
+    bad = list(check.get("mismatched") or []) + list(check.get("missing") or [])
+    head = "%d/%d files match the copy-time digest" % (matched, int(check["listed"]))
+    if not bad:
+        return head
+    return head + " -- differs: " + ", ".join(bad)
+
+
+def _home_dir(home: str | os.PathLike[str] | None) -> Path:
+    """The directory holding `autoforge.db`, asked of the store.
+
+    This used to say "resolved the way the service does" and then answer
+    `<LOCALAPPDATA>/autoforge/data` -- which the service does not use unless the
+    preset has moved it there. Measured 2026-11-06 with no `AUTOFORGE_HOME`: the
+    service answered `<LOCALAPPDATA>/autoforge`, this answered `.../data`, and
+    the probe therefore reported on a directory that was not the one holding the
+    ledger. The `data` segment is real in the preset, which is why the wrong
+    answer survived so long: it was right on the machine where it was written.
+
+    A caller-supplied `home` still wins, because a probe pointed at a throwaway
+    directory must not read the real one.
+    """
+    if home:
+        return Path(home)
+    from .store import home_dir
+
+    return Path(home_dir())
+
+
+def _skill_dirs(home: str | os.PathLike[str] | None) -> list[tuple[str, str]]:
+    """Where the skills actually are, by the library's own rules.
+
+    Deliberately delegates to `skills.default_skill_dirs` instead of guessing,
+    because the two guesses that came before this function were both wrong on
+    this machine:
+
+    * `home / "skills"` -- but `home` is the *store's* directory. The preset
+      sets `home = <LOCALAPPDATA>\\autoforge\\data` and
+      `skills = <LOCALAPPDATA>\\autoforge\\skills`, so skills sit beside `home`,
+      not under it. The probe printed `skills: MISSING` while that directory
+      held a skill.
+    * A one-level `glob("*.md")` -- but every distributed skill is a package
+      (`<category>/<name>/SKILL.md`), so a flat glob counts the agent's own flat
+      files and none of the packaged ones.
+
+    Passing `home` through matters: a caller that pointed the probe at a
+    throwaway directory should not have it read the real library, and
+    `default_skill_dirs` derives the user directory from `home` when
+    `AUTOFORGE_SKILLS_DIRS` is unset.
+    """
+    from .skills import default_skill_dirs
+
+    return default_skill_dirs(home=str(home) if home else None)
+
+
 def probe_host(home: str | os.PathLike[str] | None = None,
-               timeout: float = 1.5) -> list[str]:
+               timeout: float = 0.2) -> list[str]:
     """One read-only pass over this machine, as flat lines.
 
     Mirrors upstream's ``probe_app_versions`` in shape -- a list of lines
@@ -289,6 +352,21 @@ def probe_host(home: str | os.PathLike[str] | None = None,
     never writes, so it is safe to run before any decision, which is the whole
     point of a gate. A probe that fails is reported as a line, not raised --
     "the store is not reachable" is the finding, not an error.
+
+    The default ``timeout`` is 0.2 s, not the 1.5 s this shipped with, because
+    the block is meant to go into a per-turn prompt. Measured 2026-11-03 on this
+    machine, with nothing listening on 127.0.0.1:8000:
+
+        probe_host()          1550-1645 ms     <- one dead socket, at length
+        probe_host(timeout=0.2)  214 ms
+        probe_host(timeout=0.05)  61 ms
+          verify_vendor            5 ms       (277 KB hashed)
+          skill index             48 ms cold, 7 ms warm
+          DNS                     14 ms
+
+    The work was never the cost. The cost was a connect to a closed port with a
+    timeout chosen for a person waiting rather than for a prompt being built.
+    The answer says "down" either way; only one of them is affordable per turn.
     """
     lines: list[str] = []
     lines.append("tars vendor dir: " + _check(
@@ -297,38 +375,83 @@ def probe_host(home: str | os.PathLike[str] | None = None,
         _STATIC_SKILLS_PATH.is_file(),
         "readable", "MISSING " + str(_STATIC_SKILLS_PATH)))
     check = verify_vendor()
-    lines.append("vendor files verified: " + (
-        "none listed (MANIFEST.sha256 missing)"
-        if not check.get("checked") else
-        str(check["checked"]) + "/" + str(check["listed"]) + " match upstream" +
-        ("" if check["ok"] else " -- MISMATCH: " + ", ".join(
-            list(check["mismatched"]) + list(check["missing"])))))
+    # The numerator is *matches*, not *files read*. It used to be `checked`,
+    # which counts reads, so a run where all thirty-two files differed printed
+    # `32/32 match upstream -- MISMATCH: README.md, ...`: the first half of the
+    # sentence answering a question nobody asked, and answering it wrong. A
+    # reader skimming takes the first half as the verdict.
+    lines.append("vendor files verified: " + _vendor_sentence(check))
     try:
         n = PortedSkillSystem().count()
         lines.append("upstream skills indexed: " + str(n))
     except TarsUnavailable as exc:
         lines.append("upstream skills indexed: unavailable (" + str(exc) + ")")
 
-    home = Path(home) if home else Path(
-        os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")) / "autoforge"
-    db = home / "autoforge.db"
-    lines.append("store: " + _check(db.exists(), str(db), "not created yet"))
-    for sub in ("skills", ".archive"):
-        p = home / sub
+    home = _home_dir(home)
+    # Which *file* is the ledger is `store.db_file`'s question, not this
+    # function's. Asking it here is how the probe came to print
+    # `no autoforge.db under <home>` on a machine where the service was reading
+    # `<home>/data/autoforge.db` -- the same class of defect as 2026-11-03, with
+    # the sign flipped. The import is inside the function because `service`
+    # imports this module.
+    from .store import db_file
+
+    db_path, inherited = db_file(str(home) if home else None)
+    db = Path(db_path)
+    # The sentence names which file was chosen, and says when it was inherited:
+    # "the store is at X" and "the store is at X because the default location
+    # held nothing" are the same address and different facts.
+    lines.append("store: " + (str(db) + " (" + str(db.stat().st_size) + " bytes)"
+                              + (" [inherited from the sibling]" if inherited else "")
+                              if db.exists()
+                              else "no autoforge.db at " + str(db)
+                              + " (nor a populated one at "
+                              + str(home / "data" / "autoforge.db") + ")"))
+    # The skill directories are NOT `home / "skills"`. See `_skill_dirs`.
+    from .skills import iter_skill_files, ARCHIVE_DIR  # noqa: PLC0415
+
+    dirs = _skill_dirs(home)
+    found: list[str] = []
+    total = 0
+    for label, path in dirs:
         try:
-            n = len(list(p.glob("*.md"))) if p.is_dir() else 0
+            n = len(list(iter_skill_files(path))) if os.path.isdir(path) else 0
         except OSError:
             n = 0
-        lines.append(sub + ": " + _check(p.is_dir(),
-                                         str(n) + " file(s)", "MISSING"))
+        total += n
+        found.append("%s %d" % (label, n))
+    if not os.path.isdir(dirs[0][1]):
+        lines.append("skills: no skill directory at " + str(dirs[0][1]))
+    else:
+        lines.append("skills: %d skill(s) in %s (%s)"
+                     % (total, str(dirs[0][1]), ", ".join(found)))
+    # The archive is created on first use (`SkillLibrary.archive`), so its
+    # absence means "nothing has been archived yet", not "missing". Reporting
+    # the two the same way is how a healthy library reads as a broken one.
+    arch = [Path(p) / ARCHIVE_DIR for _label, p in dirs]
+    live = [p for p in arch if p.is_dir()]
+    if live:
+        n = sum(len(list(p.glob("*.md"))) for p in live)
+        lines.append("archive: %d file(s) in %s" % (n, str(live[0])))
+    else:
+        lines.append("archive: not created yet (first use only, under "
+                     + str(arch[0]) + ")")
 
+    # The probe goes through the door too. Both admissions are ones this
+    # process should be able to name afterwards, and the second reaches a name
+    # it does not own. Under a closed boundary the probe reports "down" and
+    # "does not resolve" -- which is true of this process, and therefore the
+    # honest answer for a host probe.
+    from .egress import admit as _admit
     t0 = time.time()
     try:
+        _admit("tcp://127.0.0.1:8000", tool="tars_probe")
         socket.create_connection(("127.0.0.1", 8000), timeout=timeout).close()
         lines.append("toolmarket 127.0.0.1:8000: up")
     except OSError:
         lines.append("toolmarket 127.0.0.1:8000: down")
     try:
+        _admit("https://github.com/", tool="tars_probe")
         socket.getaddrinfo("github.com", 443)
         # No elapsed time in this line, and that is a deliberate omission: the
         # block it belongs to goes into the system prompt every turn, and the
@@ -344,10 +467,33 @@ def probe_host(home: str | os.PathLike[str] | None = None,
     return lines
 
 
-def probe_lines(home: str | os.PathLike[str] | None = None) -> list[str]:
-    """``probe_host`` with its heading, ready to append to a prompt."""
+def probe_lines(home: str | os.PathLike[str] | None = None,
+                *, brief: bool = False) -> list[str]:
+    """``probe_host`` with its heading, ready to append to a prompt.
+
+    ``brief=True`` drops the lines that answer "where exactly" rather than "is
+    it there", for the copy that rides in every turn's prompt. Measured
+    2026-11-03: the full block is 739 characters, and three of its lines are
+    pure location -- the vendor directory's absolute path (113), where the
+    archive *would* be created (125), and the names of already-imported modules
+    (92). None of them changes what the agent does next; all of them would be
+    re-billed on every request. ``tars_probe`` still answers them in full, on
+    the one occasion somebody asks.
+
+    The store and skills lines keep their paths even in brief mode, because
+    those two are the ones that get *looked up* rather than merely confirmed --
+    a reader who is told `store: none` needs to know which directory was
+    searched before the sentence is worth anything.
+    """
+    lines = probe_host(home)
+    if brief:
+        skip = ("tars vendor dir:", "already-loaded tars skill bodies:")
+        lines = [ln for ln in lines if not ln.startswith(skip)]
+        lines = ["archive: empty (created when something is first archived)"
+                 if ln.startswith("archive: not created yet") else ln
+                 for ln in lines]
     out = ["## Host probe (read-only, this run)", ""]
-    out.extend("- " + line for line in probe_host(home))
+    out.extend("- " + line for line in lines)
     return out
 
 

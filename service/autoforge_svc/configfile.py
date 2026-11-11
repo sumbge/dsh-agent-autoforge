@@ -1,10 +1,16 @@
-"""Persistent user config for `auto` — written by `auto setup`, read by everything.
+"""Persistent user config for `auto` — read by everything, written by nothing in this tree.
+
+The docstring below used to say "written by `auto setup`", and that command is not
+shipped here: measured 2026-11-10, `auto setup` appears only in docstrings (three
+of them) and `configfile.save` has no caller anywhere. `save` is kept because it
+is the documented way for a caller outside this tree to write the file, and
+`notify` now names the path instead of pointing at a wizard that does not exist.
 
 Resolution order at use time (see `cli._config`):
 
     explicit flag  >  environment variable  >  this file  >  built-in default
 
-The file exists so that a one-time `auto setup` is genuinely enough. Relying on
+The file exists so that a one-time write is genuinely enough. Relying on
 environment variables alone breaks in a way that is invisible and infuriating:
 a shell or terminal that was already open when the variable was set never sees
 it, so the same command works in one window and fails in the next. A file has

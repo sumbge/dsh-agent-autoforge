@@ -244,9 +244,12 @@ class MissionStore:
             "INSERT INTO missions (text, parent, status, next_step, created_at,"
             " updated_at, blocked_on) VALUES (?,?,?,?,?,?,?)",
             (text, int(parent), OPEN, next_step, now, now, (blocked_on or "").strip()))
-        self._conn.commit()
         mid = int(cur.lastrowid)
-        self._log(mid, "open", text)
+        # The log row goes in BEFORE the commit, not after it. Written after,
+        # it opened a second transaction that nobody closed, and the store sat
+        # in a write transaction until the process died -- see `_log`.
+        self._log(mid, "open", text, commit=False)
+        self._conn.commit()
         return self.get(mid)
 
     def note(self, mid: int, note: str = "", next_step: str | None = None,
@@ -272,7 +275,8 @@ class MissionStore:
         args.append(mid)
         self._conn.execute(f"UPDATE missions SET {', '.join(sets)} WHERE id=?", args)
         if note:
-            self._log(mid, "note", note)
+            # Before the commit, so the note and the status move together.
+            self._log(mid, "note", note, commit=False)
         self._conn.commit()
         return self.get(mid)
 
@@ -302,7 +306,7 @@ class MissionStore:
         self._conn.execute(
             "UPDATE missions SET status=?, closed_at=?, close_note=?, updated_at=?"
             " WHERE id=?", (status, now, note or "", now, mid))
-        self._log(mid, "close", f"{status}: {note}" if note else status)
+        self._log(mid, "close", f"{status}: {note}" if note else status, commit=False)
         self._conn.commit()
         if self.focused() == mid:
             self.set_focus(0)
@@ -330,7 +334,7 @@ class MissionStore:
         now = time.time()
         self._conn.execute(
             "UPDATE missions SET status=?, updated_at=? WHERE id=?", (OPEN, now, mid))
-        self._log(mid, "wake", note or "assumption overturned")
+        self._log(mid, "wake", note or "assumption overturned", commit=False)
         self._conn.commit()
         return self.get(mid)
 
@@ -410,6 +414,72 @@ class MissionStore:
         """
         return [m for m in self.all("owed") if m.parent == mid]
 
+    def pending_transitions(self, idle_s: float = 0.0, now: float | None = None,
+                            harden: bool = True) -> dict[str, int]:
+        """Would `sweep` move anything? One query, no writes, no locks.
+
+        This exists because `report()` is right to refuse to sweep and wrong to
+        leave the rule unfired. Its comment says a reporting turn must not take
+        a write lock; the rule it protects only fails when the agent never looks
+        at the clock at all, which is what happened: `sweep` was reachable from
+        the `mission_sweep` tool and from nothing else, so a session that never
+        called it never presumed anything.
+
+        The cost that made a per-turn sweep look impossible is the search, not
+        the write. Measured 2026-11-03: `sweep()` over 50 open missions is
+        11.49 ms, because it calls `last_activity()` -- two queries -- per
+        mission. This answers the same question in one statement, 0.056 ms, flat
+        at 0 missions and at 50. So the per-turn path becomes: ask this, and pay
+        for a sweep only on the turn where something actually moves.
+
+        The error is one-sided on purpose. This may say "due" when `sweep` then
+        declines -- a mission whose log was touched between the two reads, a
+        parent whose child closed in the gap -- and that costs one redundant
+        sweep. It must never say "nothing due" while `sweep` would move
+        something, because that failure is silent: the 24h rule would stop
+        firing and nothing would ever report it. Every condition below is the
+        one the sweep itself tests, with the per-mission Python replaced by the
+        same predicates in SQL.
+
+        `assume` excludes missions with owed children, matching `sweep`'s own
+        refusal to presume a parent. That makes the count exact rather than an
+        over-estimate, which is what lets the caller skip the sweep wholesale.
+        """
+        idle_s = float(idle_s or IDLE_ASSUMPTION_S)
+        now = float(now if now is not None else time.time())
+
+        #: Scalar MAX() over the three clocks `last_activity` takes the max of.
+        #: The subquery is the newest non-'assume' log row -- the log is where a
+        #: second writer's touch is visible, which is the whole reason
+        #: `last_activity` does not just read `updated_at`.
+        assume = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM missions m "
+            "LEFT JOIN (SELECT mission, MAX(at) AS a FROM mission_log "
+            "           WHERE kind != 'assume' GROUP BY mission) l "
+            "       ON l.mission = m.id "
+            "WHERE m.status = ? "
+            "  AND COALESCE(m.blocked_on, '') = '' "
+            "  AND NOT EXISTS (SELECT 1 FROM missions c "
+            "                   WHERE c.parent = m.id AND c.status IN (?, ?)) "
+            "  AND MAX(COALESCE(m.updated_at, 0), COALESCE(m.created_at, 0), "
+            "          COALESCE(l.a, 0)) < ?",
+            (OPEN, OPEN, ASSUMED, now - idle_s)).fetchone()["n"]
+
+        harden_n = 0
+        if harden:
+            harden_n = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM missions m "
+                "LEFT JOIN (SELECT mission, MAX(at) AS a FROM mission_log "
+                "           WHERE kind = 'assume' GROUP BY mission) l "
+                "       ON l.mission = m.id "
+                "WHERE m.status = ? "
+                "  AND COALESCE(m.blocked_on, '') = '' "
+                "  AND l.a IS NOT NULL AND l.a <= ?",
+                (ASSUMED, now - RESURRECT_WINDOW_S)).fetchone()["n"]
+
+        return {"assume": int(assume), "harden": int(harden_n),
+                "total": int(assume) + int(harden_n)}
+
     def sweep(self, idle_s: float = 0.0, now: float | None = None,
               harden: bool = True) -> dict[str, Any]:
         """Apply the 24h rule. Safe to run often: it is idempotent at one instant.
@@ -464,7 +534,7 @@ class MissionStore:
                 "UPDATE missions SET status=? WHERE id=?", (ASSUMED, m.id))
             self._log(m.id, "assume",
                       f"no activity for {(now - self.last_activity(m.id)) / 3600.0:.1f}h: "
-                      f"presumed complete", at=now)
+                      f"presumed complete", at=now, commit=False)
             out["assumed"].append(m.id)
 
         if harden:
@@ -484,7 +554,7 @@ class MissionStore:
                      now, m.id))
                 self._log(m.id, "close",
                           f"assumed: hardened {(now - born) / 86400.0:.1f} days after "
-                          f"the assumption", at=now)
+                          f"the assumption", at=now, commit=False)
                 out["hardened"].append(m.id)
 
         if out["assumed"] or out["hardened"]:
@@ -583,6 +653,15 @@ class MissionStore:
         # boundary was crossed. `sweep` is driven from the places that already
         # write -- run start, and the mission tools -- so the state is current
         # where it is acted on, and this stays a pure read.
+        #
+        # 2026-11-03, amended: "the places that already write" turned out not
+        # to include anything that runs on a normal turn, so the rule only
+        # fired when the agent happened to call `mission_sweep`. The reader is
+        # still pure -- nothing here writes -- but the caller now asks
+        # `pending_transitions()` first and sweeps only when the answer is not
+        # zero. That keeps this method's promise (no write on a read) while
+        # letting the clock be checked every turn: the check is 0.056 ms and
+        # the sweep only costs 11.49 ms on the turn it has work to do.
         whoosh = (f"\n    (the {int((idle_s or IDLE_ASSUMPTION_S) // 3600)}h rule: a mission "
                   f"silent that long is presumed complete, not deleted -- "
                   f"mission_note M<id> takes it back)")
@@ -632,17 +711,49 @@ class MissionStore:
 
     # -- internals --------------------------------------------------------
     def _log(self, mid: int, kind: str, note: str = "",
-             at: float | None = None) -> None:
+             at: float | None = None, commit: bool = True) -> None:
         """Append to the mission's own log. `at` is injectable for the sweep.
 
         The sweep runs on a clock it may be handed rather than the wall clock, so
         an assumption recorded at a synthetic time has to be written down at that
         same synthetic time -- otherwise the hardening clock in the tests, and in
         any replay, would disagree with the decision that was made.
+
+        `commit=False` is for callers that already own the transaction and commit
+        it themselves (`finish`, `wake`, `note`, `sweep`); they call this BEFORE
+        their commit so the log row and the status change land together or not
+        at all.
+
+        Why the default is `commit=True` and why that matters
+        -----------------------------------------------------
+        This method used to never commit, and `open()` called it AFTER its own
+        commit. An INSERT in sqlite3's legacy transaction mode opens a
+        transaction, so that left the mission store's connection permanently
+        inside an open write transaction -- the one it opened at the last
+        `open()`. Reads kept working. Every other writer, including the tool
+        store's ledger on another connection to the same file, got
+        `database is locked` against a 15s busy timeout, and the `-wal` sidecar
+        froze.
+
+        Measured on this machine 2026-11-01: `-wal` stopped at 527,392 bytes
+        (128 frames) at 18:21:12 -- the exact second M5 was opened -- the file
+        mtime did not move for seven minutes, and `BEGIN IMMEDIATE` from three
+        separate processes all failed. `autoforge_tool_call` and
+        `autoforge_log_event` both returned `OperationalError: database is
+        locked`. The service looked idle (2.25s CPU, one thread) while holding
+        a write lock the whole time, which is why it read as contention.
+
+        The `mission_log` table is the receipt for this: M2, M4 and M5 have no
+        `open` row, because those inserts were never committed and were rolled
+        back when the connection was eventually closed. A mission list with
+        missions whose own log never records that they were opened is the
+        symptom; a frozen ledger is the cost.
         """
         self._conn.execute(
             "INSERT INTO mission_log (mission, at, kind, note) VALUES (?,?,?,?)",
             (mid, float(at if at is not None else time.time()), kind, note))
+        if commit:
+            self._conn.commit()
 
     @staticmethod
     def _row(r: sqlite3.Row) -> Mission:

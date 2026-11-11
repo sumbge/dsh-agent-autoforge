@@ -183,6 +183,33 @@ def channels_from_config(config: dict[str, Any] | None) -> tuple[list[Channel], 
     return channels, problems
 
 
+def _config_hint() -> str:
+    """Where `notify.channels` would have to go, and who would put it there.
+
+    Measured 2026-11-10: both refusals in this class used to say "in the config
+    file" and name no file. The file meant is `configfile.config_path()` --
+    `Path.home() / ".autoforge" / "config.json"` unless `$AUTOFORGE_CONFIG`
+    says otherwise -- and it did not exist on the machine where this was read.
+    That is precisely the case these sentences are for: a reader told "add it
+    to the config file" with no path has to guess, and on Windows the obvious
+    guess is not in the home directory the rest of the package uses.
+
+    The second half matters as much as the path. `configfile.save` exists and
+    has no caller in this tree, and the "written by `auto setup`" in
+    `configfile`'s own docstring describes a command this tree does not ship
+    (measured: zero hits for `auto setup` outside those docstrings). So a
+    person is told to create the file by hand, rather than sent looking for a
+    setup wizard that is not here.
+    """
+    try:
+        from . import configfile
+        path = str(configfile.config_path())
+    except Exception:                                        # noqa: BLE001
+        return "`notify.channels` in the config file"
+    return ("`notify.channels` in %s -- create that file by hand if it is not "
+            "there; nothing in this package writes it" % path)
+
+
 class Notifier:
     """Every configured channel, and an honest account of each send."""
 
@@ -199,7 +226,7 @@ class Notifier:
     def describe(self) -> str:
         if not self.channels:
             return ("No notification channels are configured. Add them under "
-                    "`notify.channels` in the config file.")
+                    + _config_hint() + ".")
         lines = [f"{len(self.channels)} channel(s) configured:"]
         lines += [f"  {c.describe()}" for c in self.channels]
         return "\n".join(lines)
@@ -215,7 +242,7 @@ class Notifier:
         if not self.channels:
             raise NotifyError(
                 "no notification channels are configured, so nothing was sent. "
-                "Add them under `notify.channels` in the config file.")
+                "Add them under " + _config_hint() + ".")
         chosen = [c for c in self.channels if only is None or c.name in only]
         if not chosen:
             raise NotifyError(
@@ -248,6 +275,14 @@ class Notifier:
         headers.update(ch.headers)
         request = urllib.request.Request(ch.url, data=body, headers=headers,
                                          method=ch.method)
+        # One door out, even for a URL the operator typed themselves. The
+        # webhook is the clearest case for it: the address is configuration,
+        # and configuration is exactly what a boundary is supposed to judge.
+        # `GatewayDenied` is caught by the `except Exception` below and becomes
+        # a failed Delivery carrying the rule, so a refusal reads as a refusal
+        # rather than as a network fault.
+        from .egress import admit as _admit
+        _admit(ch.url, tool="notify:%s" % ch.name)
         try:
             with urllib.request.urlopen(request, timeout=ch.timeout) as response:
                 status = getattr(response, "status", None) or response.getcode()

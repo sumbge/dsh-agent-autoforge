@@ -107,6 +107,46 @@ Each must be structurally different from the others.
 Wrap each in the standard JSON envelope."""
 
 
+def _text_field(data: dict[str, Any], key: str, default: str = "") -> str:
+    """Read a model-supplied string field, or say what was there instead.
+
+    Measured 2026-11-07: three runs out of ten of `chk_five.py` died inside the
+    breed step with `AttributeError: 'dict' object has no attribute 'strip'`,
+    because a model answered `name`, `description` or `code` with an object and
+    the parser called `.strip()` on it. Both silent repairs are wrong: `str(v)`
+    would store `"{'role': 'x'}"` as a tool name, and `""` would report that the
+    model said nothing when it said something unusable. A string is stripped,
+    `None` takes the default, anything else raises with the field, the type and
+    an excerpt.
+    """
+    value = data.get(key, default)
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip()
+    raise ValueError(
+        "the model answered %r with %s instead of a string: %r"
+        % (key, type(value).__name__, repr(value)[:120])
+    )
+
+
+def _sample_call(value: Any) -> dict[str, Any]:
+    """A sample call as a dict, or empty if the model gave something else.
+
+    Only a mapping can be a call. Anything else -- a string of arguments, a list
+    of positional values, a number -- is not something `ToolSpec` can run, and
+    passing it through would fail later inside the sandbox with an error about
+    the wrong thing.
+
+    Module level, not a staticmethod on `EvolutionEngine`, because
+    `_parse_population` is itself a staticmethod: a bare name inside it is looked
+    up in the module globals, not on the class, so a helper defined beside it is
+    invisible. Measured 2026-11-11 as `NameError: name '_sample_call' is not
+    defined` on the first run after it was added there.
+    """
+    return dict(value) if isinstance(value, dict) else {}
+
+
 @dataclass
 class Mutant:
     generated: GeneratedTool
@@ -327,9 +367,9 @@ class EvolutionEngine:
             if p.get("query")
         ]
         return GeneratedTool(
-            name=data.get("name", "hybrid").strip(),
-            description=data.get("description", "").strip(),
-            code=data.get("code", "").strip(),
+            name=_text_field(data, "name", "hybrid"),
+            description=_text_field(data, "description"),
+            code=_text_field(data, "code"),
             parameters=data.get("parameters") or {"type": "object", "properties": {}},
             entry=data.get("entry") or data.get("name", ""),
             probes=probes,
@@ -438,12 +478,23 @@ class EvolutionEngine:
                 if p.get("query")
             ]
             results.append(GeneratedTool(
-                name=data.get("name", "").strip(),
-                description=data.get("description", "").strip(),
-                code=data.get("code", "").strip(),
+                name=_text_field(data, "name"),
+                description=_text_field(data, "description"),
+                code=_text_field(data, "code"),
                 parameters=data.get("parameters") or {"type": "object", "properties": {}},
                 entry=data.get("entry") or data.get("name", ""),
                 probes=probes,
+                # The model is asked for these two and answers with them; this
+                # function used to throw them away, so a mutant arrived at the
+                # verifier with no positive case and `execution` reported
+                # "UNPROBED: no valid sample call was declared". Measured
+                # 2026-11-11: an envelope carrying
+                # `"sample_call": {"word": "banana"}, "sample_expect": "3"` came
+                # back as `{}` and `''`. `_to_spec` was fixed on the same day for
+                # forwarding them -- but forwarding a field that was dropped one
+                # step earlier forwards nothing. Both ends had to be told.
+                sample_call=_sample_call(data.get("sample_call")),
+                sample_expect=_text_field(data, "sample_expect"),
                 effect_signature=data.get("effect_signature", "pure"),
                 tags=data.get("tags") or [],
                 rationale=data.get("rationale", ""),
@@ -461,6 +512,21 @@ class EvolutionEngine:
             source="evolved",
             probes=g.probes,
             effect_signature=g.effect_signature,
+            # `sample_call` and `sample_expect` were dropped here, and the same
+            # two fields were dropped from `ForgePipeline._to_spec` until
+            # 2026-10-02. That one was found and fixed; this one was not, because
+            # the fix was made where the symptom appeared (every tool on the
+            # ledger verifying with no positive example) and nobody looked at the
+            # other translation. Measured 2026-11-11: the same GeneratedTool
+            # through the two `_to_spec`s gave `{'word': 'banana'}` and `{}`, and
+            # the evolution copy's `execution` check reported
+            # "UNPROBED: no valid sample call was declared". A mutant that never
+            # declares a sample can never pass `verify()` -- `report.passed`
+            # requires every check, and an unprobed check is not a pass -- so
+            # `EvolutionResult.improved` was structurally unreachable no matter
+            # what the breeder wrote. That is what this line is for.
+            sample_call=dict(g.sample_call or {}),
+            sample_expect=g.sample_expect or "",
             tags=g.tags,
             state=ToolState.DRAFT,
         )

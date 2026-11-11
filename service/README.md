@@ -36,13 +36,22 @@ DSH 自带网关（`vendor/channel-pack/src/openai-gateway`，默认 `127.0.0.1:
 ## 环境
 
     AUTOFORGE_HOME    状态目录（默认 %LOCALAPPDATA%\autoforge）
-    AUTOFORGE_MODEL   模型 id，默认 xdpool-global/deepseek-v4.1-flash
+    AUTOFORGE_MODEL   模型 id；不设则从当前 DSH profile 的 cordis.patch.yml 推导
     AUTOFORGE_BASE_URL 网关地址，默认 http://127.0.0.1:8326/v1
     AUTOFORGE_API_KEY 网关 key；不设则读 $DSH_HOME/openai-gateway/api-key
     DSH_HOME          DSH 家目录，默认 ~/.dsh
 
 模型 id 用 DSH 的 `provider/model` 形式，可选值见
 `curl -H "Authorization: Bearer <key>" http://127.0.0.1:8326/v1/models`。
+
+这里曾经硬编码过 `xdpool-global/deepseek-v4.1-flash`，而本机网关只提供
+`xdpool/deepseek-v4.1-flash`（`xdpool-global` 那条泳道只有 `-sg` 后缀），
+于是 forge 与每一个定时任务都在第一次模型调用上 404。所以现在不猜：按
+`$AUTOFORGE_MODEL` → `profiles/<name>/cordis.patch.yml` 里的
+`agent-default-model: {provider, model}` → 同一个 profile 的
+`enabledModelIds` 顺序取第一个能读到的，读不到就**报错并说明去哪里找**，
+而不是发一个看着合理的 id。`report()` 的 `model` 块会显示当前生效的 id
+以及它是从哪个文件来的。
 
 ## 跑
 
@@ -68,7 +77,7 @@ DSH 自带网关（`vendor/channel-pack/src/openai-gateway`，默认 `127.0.0.1:
 
 ## 已验证（2026-10-24）
 
-    _forge_route() -> model=xdpool-global/deepseek-v4.1-flash, base=...:8326/v1, key 43 字符
+    _forge_route() -> model=xdpool/deepseek-v4.1-flash, base=...:8326/v1, key 43 字符
     forge_tool("Convert a temperature from Celsius to Fahrenheit...")
       -> 22.6s, celsius_to_fahrenheit [active], 六道全 PASS
       -> 生成的代码是真正的转换函数（含 None/bool/空串/单位后缀/NaN/Inf 处理）

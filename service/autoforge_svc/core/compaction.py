@@ -44,6 +44,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol, Sequence
 
+from ..store import home_dir
 from .message import Message
 
 __all__ = [
@@ -161,10 +162,13 @@ _MARKER = "─" * 8 + " [TRUNCATED] " + "─" * 8
 
 
 def spill_dir() -> str:
-    """Where over-long outputs are kept in full, beside the rest of the state."""
-    home = (os.environ.get("AUTOFORGE_HOME")
-            or os.path.join(os.path.expanduser("~"), ".autoforge"))
-    return os.path.join(home, "spill")
+    """Where over-long outputs are kept in full, beside the rest of the state.
+
+    "Beside the rest of the state" was a claim about a different directory:
+    `<home>/.autoforge` here, `$LOCALAPPDATA/autoforge` in the store. See
+    `store.home_dir`.
+    """
+    return os.path.join(home_dir(), "spill")
 
 
 def transcripts_dir() -> str:
@@ -797,9 +801,7 @@ class CompactionEvent:
 
 def default_log_path() -> str:
     """Append-only record of every summary, beside the rest of the state."""
-    home = (os.environ.get("AUTOFORGE_HOME")
-            or os.path.join(os.path.expanduser("~"), ".autoforge"))
-    return os.path.join(home, "compaction.log.md")
+    return os.path.join(home_dir(), "compaction.log.md")
 
 
 # ---------------------------------------------------------------------------

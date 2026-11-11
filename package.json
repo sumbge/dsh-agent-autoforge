@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-agent-autoforge",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "private": true,
   "description": "Agent preset that mounts the autoforge service (memory, missions, skills, durable tools) as model-facing DSH tools.",
   "type": "module",
@@ -13,9 +13,11 @@
   "files": [
     "lib",
     "presets",
+    "service",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "PLUGIN.md"
   ],
   "icon": "./icon.svg",
   "dsh": {

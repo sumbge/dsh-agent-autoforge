@@ -159,6 +159,12 @@ def _post_watchable(
     it finishes on its own, and the worker is a daemon so a process exit never
     blocks on it.
     """
+    # Every request to a model endpoint leaves through the same door as every
+    # other outbound call. This is the site the gate exists for: it is the one
+    # connection that carries a credential, and the one an operator is most
+    # likely to point at a host they did not intend.
+    from ..egress import admit as _admit
+    _admit(endpoint, tool="llm.chat")
     if should_abort is None and on_wait is None:
         return requests.post(endpoint, headers=headers, json=payload,
                              timeout=timeout, proxies=proxies)
@@ -686,6 +692,11 @@ class DSHGatewayClient(LLMClient):
         req = urllib.request.Request(
             self.BASE, data=json.dumps(body).encode("utf-8"),
             headers=headers, method="POST")
+        # Same door as every other outbound call: the streaming path is the
+        # second way this module reaches the endpoint, and a gate that covered
+        # only the first one would be a hole the size of the path actually used.
+        from ..egress import admit as _admit
+        _admit(self.BASE, tool="llm.chat")
         content, reasoning, calls, usage = "", "", [], {}
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:

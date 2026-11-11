@@ -3,10 +3,14 @@
     - id: agent-autoforge-tools
       name: '@local/dsh-agent-autoforge'
       config:
+        # Replace these four with paths on your own machine (or delete them and
+        # let the plugin derive: cwd beside lib/, home/skills under
+        # %LOCALAPPDATA%\autoforge). `python` here is the command name the
+        # plugin probes; on Windows prefer `py` or an absolute interpreter.
         python: python
-        cwd: C:\Users\32535\Desktop\dsh\autoforge-svc-gw
-        home: C:\Users\32535\Desktop\dsh\autoforge-svc-gw\.data
-        skills: C:\Users\32535\AppData\Local\autoforge\skills
+        cwd: C:\autoforge\service
+        home: C:\autoforge\.data
+        skills: C:\autoforge\skills
         timeoutMs: 600000
     - id: llm-xdpool-verify
       name: '@local/dsh-agent-autoforge/xdpool-route'

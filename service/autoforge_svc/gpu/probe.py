@@ -66,7 +66,13 @@ class DeviceInfo:
     count: int = 0
     name: str = ""
     compute_capability: tuple[int, int] | None = None
-    sm_count: int = 0
+    #: Streaming-multiprocessor count, or None when the backend that answered
+    #: cannot see it. `0` used to mean both "no device" and "this backend does
+    #: not report SMs", so a real RTX 3050 printed "0 SMs" -- a number where the
+    #: answer was *unknown*, which reads as a measurement of zero hardware. The
+    #: `nvidia-smi` backend asks only for name/cc/memory/driver and says so in
+    #: its notes; the honest rendering is "unavailable", not a zero.
+    sm_count: int | None = None
     total_memory_bytes: int = 0
     driver_version: str = ""
     runtime_version: str = ""
@@ -109,7 +115,9 @@ class DeviceInfo:
         cc = f"sm_{self.compute_capability[0]}{self.compute_capability[1]}" \
             if self.compute_capability else "unknown arch"
         mem = f"{self.total_memory_bytes / 2**30:.1f} GiB" if self.total_memory_bytes else "?"
-        return (f"{self.name} x{self.count} ({cc}, {self.sm_count} SMs, {mem}) "
+        sms = (f"{self.sm_count} SMs" if self.sm_count is not None
+               else "SM count unavailable")
+        return (f"{self.name} x{self.count} ({cc}, {sms}, {mem}) "
                 f"via {self.backend}; driver {self.driver_version or '?'}, "
                 f"runtime {self.runtime_version or '?'}")
 
@@ -164,7 +172,7 @@ def _from_torch() -> DeviceInfo | None:
             count=count,
             name=props.name,
             compute_capability=cc,
-            sm_count=getattr(props, "multi_processor_count", 0),
+            sm_count=getattr(props, "multi_processor_count", None),
             total_memory_bytes=getattr(props, "total_memory", 0),
             driver_version=getattr(props, "driver_version", "") or "",
             runtime_version=getattr(torch.version, "cuda", "") or "",
@@ -199,7 +207,8 @@ def _from_cupy() -> DeviceInfo | None:
             count=count,
             name=name,
             compute_capability=cc,
-            sm_count=int(props.get("multiProcessorCount", 0)),
+            sm_count=(int(props["multiProcessorCount"])
+                      if "multiProcessorCount" in props else None),
             total_memory_bytes=int(props.get("totalGlobalMem", 0)),
             runtime_version=str(cupy.cuda.runtime.runtimeGetVersion()),
             nvcc_version=_nvcc_version(),
@@ -243,11 +252,12 @@ def _from_nvidia_smi() -> DeviceInfo | None:
         count=len(lines),
         name=name,
         compute_capability=cc,
+        sm_count=None,                # this backend does not ask for it
         total_memory_bytes=mem,
         driver_version=first[3] if len(first) > 3 else "",
         nvcc_version=_nvcc_version(),
         notes=["nvidia-smi only: SM count and runtime version unavailable "
-               "without a Python GPU library"],
+               "without a Python GPU library (torch or cupy)"],
     )
 
 

@@ -438,8 +438,20 @@ class ToolRegistry:
                 pass
 
     def rehab(self, name: str, *, require_clean: int = 2) -> ToolSpec:
-        """Bring a quarantined tool back on trial after it proves itself again."""
+        """Bring a quarantined tool back on trial after it proves itself again.
+
+        The counters are zeroed so the tool is judged on its behaviour from
+        here on -- that is the point of a trial. `history` is deliberately NOT
+        cleared: those calls happened, and `evolve_tool`/`describe_tool` read
+        the list to explain a quarantine that is now in the past. The two are
+        reconciled by `calls_not_in_counters`, so the pair cannot look like
+        corruption: a tool with `calls: 0`, `history: 6` and
+        `calls_not_in_counters: 6` says what happened, where the same row
+        without the third number says the store is broken. Measured
+        2026-11-02: `fake_file_size` sat in that state on the live database.
+        """
         spec = self._tools[name]
+        spec.stats.calls_not_in_counters += spec.stats.calls
         spec.stats.consecutive_failures = 0
         spec.stats.calls = 0
         spec.stats.successes = 0
@@ -460,6 +472,21 @@ class ToolRegistry:
     def promote(self, name: str) -> ToolSpec:
         spec = self._tools[name]
         self._set_state(spec, ToolState.ACTIVE, "promote")
+        return spec
+
+    def demote(self, name: str, reason: str = "evaluation_failed") -> ToolSpec:
+        """Withdraw the ACTIVE seal without hiding the tool.
+
+        The mirror of `promote`, and it had no counterpart: a tool whose battery
+        stopped passing had no route back down except `quarantine`, which hides
+        it from the model entirely. Those are different judgements -- "this is
+        not trusted without a re-check" is not "this is harmful" -- and
+        conflating them meant an ACTIVE tool that began failing stayed ACTIVE
+        until it failed three calls in a row, which measures the wrong thing.
+        Stays callable and visible, exactly as PROBATION always is.
+        """
+        spec = self._tools[name]
+        self._set_state(spec, ToolState.PROBATION, "demote", {"reason": reason})
         return spec
 
     # -- reporting -------------------------------------------------------

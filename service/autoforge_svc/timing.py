@@ -182,7 +182,30 @@ def from_wallclock(seconds: float) -> Duration:
 # cries wolf on its own documentation gets switched off, and then it protects
 # nothing. Walking the tree lets us skip bare string statements (docstrings)
 # while still seeing a real f-string used as code.
-_MS_WORD_RE = re.compile(r"(?<![A-Za-z_])ms(?![A-Za-z_])")
+_MS_WORD_RE = re.compile(r"(?<![A-Za-z_])ms(?![A-Za-z_]|[a-z])")
+
+
+def _is_ms_door(name: str) -> bool:
+    """Whether a callable name promises milliseconds.
+
+    `_MS_WORD_RE` answers a different question -- "does this string label
+    a quantity in ms" -- and answers it with word boundaries, which is
+    right for the label and wrong for the door. `from_ms` fails that
+    lookbehind because an underscore stands before the `ms`, so a scan
+    gated on it could never reach the only names this check is about.
+    Measured 2026-11-06: `Duration.from_ms(perf_counter() - start)` --
+    the exact line the docstring of `audit_ms_from_seconds` promises to
+    catch -- produced zero offences, because line 304 turned the loop
+    away one line before the timer test that would have fired.
+
+    So this splits on the underscores and on the camelCase humps and
+    asks whether any piece is spelled `ms`. `params` is one piece and
+    none of it is `ms`; `fromMs`, `from_ms` and `ms` all are.
+    """
+    if not name:
+        return False
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    return any(piece.lower() == "ms" for piece in spaced.split("_"))
 
 
 def _is_thousand(node: ast.AST) -> bool:
@@ -246,6 +269,30 @@ def audit_ms_scale(src: str) -> list[MsOffence]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.stmt):
             continue
+        # A compound statement is not a line of code; it is a container for
+        # lines. Two things went wrong while it was treated as one, and both
+        # were measured on 2026-11-06 against this package:
+        #
+        #   a false positive. `_mentions_ms` walks the whole subtree, so a
+        #   docstring inside a def labelled every statement in that body.
+        #   `def ms(self)` whose docstring says "in ms", returning
+        #   `self.seconds * 1000.0`, was reported as a thousand-factor bug --
+        #   which is precisely the conversion it is, done correctly. Three
+        #   real files in the tree were flagged this way: `timing.py` itself,
+        #   the busy_timeout PRAGMA in `store.py`, and `timings_ms` in
+        #   `cpu/safety.py`.
+        #
+        #   a duplicate. One offending line inside a class was reported three
+        #   times: once for the ClassDef, once for the FunctionDef, once for
+        #   the statement. The walk already reaches the statement.
+        #
+        # So compound statements are skipped, not the statements inside them --
+        # walk() still visits every simple statement.
+        if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign,
+                                 ast.Return, ast.Expr, ast.Raise, ast.Assert,
+                                 ast.Delete, ast.Import, ast.ImportFrom,
+                                 ast.Pass, ast.Break, ast.Continue)):
+            continue
         # A statement that is nothing but a string is a docstring or a stray
         # literal. It is not executing a conversion, so it must not be flagged.
         if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
@@ -301,11 +348,8 @@ def audit_ms_from_seconds(src: str) -> list[MsOffence]:
         fn = node.func
         name = fn.attr if isinstance(fn, ast.Attribute) else (
             fn.id if isinstance(fn, ast.Name) else "")
-        if not _MS_WORD_RE.search(name):
-            continue
         # `from_ms`, `as_ms`, `to_ms` — a door whose name promises milliseconds.
-        lowered = name.lower()
-        if not any(tok in lowered for tok in ("from", "as", "to")) or "s" not in lowered:
+        if not _is_ms_door(name):
             continue
         if not any(_seconds_timer(inner) for inner in node.args):
             continue
@@ -353,11 +397,34 @@ def audit_source_tree(paths, *, lints=None) -> dict[str, list[MsOffence]]:
         elif p.exists():
             files = [p]
         else:
+            # A path that is not there is not a clean path. Skipping it made
+            # `cpu_units_audit(path="typo.py")` answer "No thousand-factor
+            # offences in ...", which is indistinguishable from having read
+            # the file and found nothing -- the caller cannot tell a pass from
+            # a miss. Measured 2026-11-06: the same sentence came back for a
+            # path with the bug in it, a path without it, and a path that has
+            # never existed. Reported as un-auditable, the way unparseable
+            # source already is.
+            bad[str(p)] = [MsOffence(
+                line_no=0, line="",
+                reason=f"no such file or directory, so nothing was audited",
+            )]
             continue
         for f in files:
             try:
-                src = f.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+                # `utf-8-sig`, not `utf-8`: a leading BOM is a convention about
+                # the file, not a character in the source. Read as plain utf-8
+                # it survives as U+FEFF and `ast.parse` refuses it, so the audit
+                # answered "source does not parse" for every file saved by an
+                # editor that writes a BOM. Measured 2026-11-06: 13 files under
+                # tests/regression/ were silently unauditable, and the report
+                # did say so -- in one line, about a file it never looked at.
+                src = f.read_text(encoding="utf-8-sig", errors="replace")
+            except OSError as exc:
+                bad[str(f)] = [MsOffence(
+                    line_no=0, line="",
+                    reason=f"could not be read, so nothing was audited: {exc}",
+                )]
                 continue
             hits: list[MsOffence] = []
             for check in checks:

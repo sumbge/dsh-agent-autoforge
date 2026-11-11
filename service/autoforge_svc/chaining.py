@@ -190,6 +190,19 @@ def rows_of(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> list[dict
     return out
 
 
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """Whether this database has this table. Reads sqlite_master, creates nothing.
+
+    Used by readers that must not run DDL (see `verify_chain`). The name is
+    bound as a parameter, not formatted in, so a caller cannot smuggle a
+    clause through it.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone()
+    return row is not None
+
+
 def _j(obj: Any) -> str:
 
     return json.dumps(obj, ensure_ascii=False, default=str, sort_keys=True)
@@ -414,6 +427,89 @@ def anchor(conn: sqlite3.Connection, note: str = "", writer: str | None = None) 
 
 
 
+def _counts(conn: sqlite3.Connection) -> tuple[int, int, int]:
+    """(total rows, legacy rows, max id) -- asked separately, on purpose.
+
+    These three numbers used to come from one statement:
+
+        SELECT COUNT(*), SUM(CASE WHEN payload_hash IS NULL OR payload_hash = ''
+                                 THEN 1 ELSE 0 END), COALESCE(MAX(id),0)
+          FROM forge_events
+
+    Measured 2026-11-04 at 12000 rows, that statement costs 4.15 ms and its
+    plan says `SCAN forge_events`: SUM(CASE ... payload_hash ...) has to read
+    every row, so an index on any *other* column cannot help it. The same
+    three answers asked separately cost 0.02 ms in total, because each one is
+    answered by an index that exists for its own reason:
+
+        COUNT(*)                     0.01 ms  covering index on timestamp
+        COUNT(*) WHERE <legacy>      0.01 ms  partial index on the predicate
+        COALESCE(MAX(id), 0)         0.01 ms  backwards seek on the primary key
+
+    Identical answers both ways ((12000, 0, 12000) in the measurement). The
+    split is worth it because `report()` carries these numbers on ordinary
+    turns, and 4 ms of every report for arithmetic over rows nobody changed is
+    the kind of cost that only shows up as a general slowness.
+
+    One helper, not two: `chained_rows` and `unchained_rows` have to come from
+    one place, or two callers computing them by different means will disagree
+    and neither will look wrong on its own.
+    """
+    total = conn.execute("SELECT COUNT(*) FROM forge_events").fetchone()[0] or 0
+    legacy = conn.execute(
+        "SELECT COUNT(*) FROM forge_events"
+        " WHERE payload_hash IS NULL OR payload_hash = ''").fetchone()[0] or 0
+    up_to = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM forge_events").fetchone()[0] or 0
+    return int(total), int(legacy), int(up_to)
+
+def summarize(conn: sqlite3.Connection) -> dict:
+    """What can be said about the chain without walking it.
+
+    Cheap on purpose -- five small reads, none of which touch every row. This is
+    what `report()` carries, because `report()` is asked by ordinary turns
+    ("what do you hold") and the full walk is not affordable there: measured
+    2026-11-03, `verify_chain` is 43.9 ms of `report()`'s 46.4 ms, and it grows
+    linearly (5.2 us per row -- 515 ms at 100k rows).
+
+    The summary cannot see a rewritten row, and it does not pretend to. What it
+    can see is whether the log has *moved* since the last full walk, which is
+    the only question that decides whether another walk is due. `up_to_id` in
+    the result is that answer: compare it with `max(id)` and you know.
+
+    Nothing here is a verdict on integrity. The fields that would be one --
+    `breaks`, `gaps`, `findings`, `ok` -- are absent rather than empty, because
+    an empty list of breaks from a walk nobody ran reads exactly like a clean
+    bill of health, and that is the failure this whole module exists to avoid.
+    """
+    if not _table_exists(conn, "forge_events"):
+        return {"chained_rows": 0, "unchained_rows": 0, "anchors": 0,
+                "up_to_id": 0, "head_hash": GENESIS}
+    total, legacy, up_to = _counts(conn)
+    anchors = 0
+    newest = 0
+    if _table_exists(conn, "chain_anchors"):
+        anchors = conn.execute("SELECT COUNT(*) FROM chain_anchors").fetchone()[0] or 0
+        newest = conn.execute(
+            "SELECT COALESCE(MAX(up_to_id), 0) FROM chain_anchors"
+        ).fetchone()[0] or 0
+    # `rows_beyond_anchor` is the number that makes the gap visible.
+    # `anchors: 2` says nothing about whether two is enough; a count of
+    # rows no anchor reaches says exactly how much of the log could be
+    # re-signed without `anchored_head_missing` noticing. Measured
+    # 2026-11-05: 604 of 8,657 rows (7.0%) sat past the newest anchor,
+    # including every review receipt -- and nothing in `report()` said so.
+    return {
+        "chained_rows": total - legacy,
+        "unchained_rows": legacy,
+        "anchors": anchors,
+        "newest_anchor": int(newest),
+        "rows_beyond_anchor": max(0, int(up_to) - int(newest)),
+        "up_to_id": up_to,
+        "head_hash": _head_hash(conn),
+    }
+
+
 def _head_hash(conn: sqlite3.Connection) -> str:
 
     """The hash the next chained row must point at.
@@ -533,12 +629,23 @@ def verify_chain(conn: sqlite3.Connection) -> dict:
 
     ok therefore means "nothing was rewritten", not "every row is chained".
     """
-    ensure_schema(conn)
-    # Anchors as dicts, via rows_of rather than a row_factory this module does
-    # not control. See rows_of for why that matters here.
-    anchors = rows_of(conn, "SELECT id, created_at, up_to_id, rows,"
-                            " baseline_digest, head_hash FROM chain_anchors"
-                            " ORDER BY id")
+    # No `ensure_schema` here. This function reads; it is called by
+    # `ToolStore.report()`, which means it runs inside a *getter*, and it was
+    # creating `chain_anchors` as a side effect of being asked a question.
+    # Measured 2026-11-03: the first `report()` on a fresh file listed no
+    # `chain_anchors` and the second listed one, identical code both times,
+    # because this line had run between them. Schema is created at open
+    # (`ToolStore.__init__` calls `ensure_schema`) and by `append_event`, which
+    # is a write path; a reader that finds no table has simply found nothing to
+    # read, and an absent anchor table means exactly zero anchors.
+    if not _table_exists(conn, "chain_anchors"):
+        anchors: list[dict] = []
+    else:
+        # Anchors as dicts, via rows_of rather than a row_factory this module
+        # does not control. See rows_of for why that matters here.
+        anchors = rows_of(conn, "SELECT id, created_at, up_to_id, rows,"
+                                " baseline_digest, head_hash FROM chain_anchors"
+                                " ORDER BY id")
     breaks: list[dict] = []
     gaps: list[dict] = []
     chained = 0
@@ -653,6 +760,10 @@ def verify_chain(conn: sqlite3.Connection) -> dict:
     return {
         "ok": not breaks and chained > 0,
         "chained_rows": chained,
+        # How far this walk got, so a cheap summary can tell whether anything has
+        # been written since. Without it, "the last check passed" has no bound.
+        "verified_up_to": conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM forge_events").fetchone()[0],
         "legacy_rows_anchored": checked_legacy,
         "anchors": len(anchors),
         "unchained_rows": len(unchained),

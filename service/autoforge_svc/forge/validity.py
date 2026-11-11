@@ -68,7 +68,26 @@ _EFFECT_PATTERNS: tuple[EffectPattern, ...] = (
     ),
     EffectPattern(
         "filesystem_write",
-        re.compile(r"""open\s*\([^)]*['"][waxr]\+?b?['"]|\b(?:shutil\.move|shutil\.copy|os\.rename|os\.replace)\b"""),
+        # A mode argument, and only a mode argument. The first version read
+        # `[^)]*['"][waxr]\+?b?['"]`, which matched the *path* when it happened
+        # to be a one-character string: `open("x")` was labelled a write
+        # because `x` is also the exclusive-create mode, and `open("x").read()`
+        # with it. Measured 2026-11-03: every one of those eleven forms below
+        # was a write, including the four that only read. The consequence was
+        # not cosmetic -- a tool that only reads a file could never declare
+        # `read_only`, because `_scope_gate` compares the labels it can see
+        # against what the scope permits and read_only permits no write. The
+        # false label made an honest declaration look like scope creep.
+        #
+        # So the mode has to be in the mode position: after a comma, or after
+        # `mode=`. `open(p)` and `open(p, "r")` are reads and get no label at
+        # all -- this table has no `filesystem_read`, and inventing one here
+        # would put a capability into `SCOPE_ALLOWANCES` that
+        # `autonomy/confirm.py` deliberately keeps out of it (see `_SCOPE_EXTRA`).
+        re.compile(
+            r"""open\s*\([^)]*,\s*(?:mode\s*=\s*)?['"][rbtwa+]*[wax+][rbtwa+]*['"]"""
+            r"""|\b(?:shutil\.move|shutil\.copy|os\.rename|os\.replace)\b"""
+        ),
     ),
     EffectPattern(
         "subprocess",
@@ -86,7 +105,24 @@ _EFFECT_PATTERNS: tuple[EffectPattern, ...] = (
     ),
     EffectPattern(
         "network_egress",
-        re.compile(r"\b(?:requests\.|urllib\.request|urlopen|http\.client|socket\.socket|ftplib|smtplib|paramiko)\b"),
+                # Widened 2026-11-05, and the measurement is why. The rule used to
+        # name `socket\.socket` and nothing else from that module, so
+        # `socket.create_connection(...)` -- the ordinary way to dial out --
+        # carried no label at all and `derived_scope` called the tool
+        # `read_only`. The constructor is the rare spelling; the helpers are
+        # the common one. Resolution counts as egress too: a tool that looks
+        # a host up has already talked to the network, and DNS is where an
+        # exfiltration channel usually starts.
+        re.compile(
+            r"\b(?:"
+            r"requests\.|urllib\.request|urlopen|http\.client"
+            r"|socket\s*\.\s*(?:socket|create_connection|create_server"
+            r"|socketpair|fromfd|getaddrinfo|gethostbyname|gethostbyname_ex"
+            r"|gethostbyaddr|getfqdn|getnameinfo|inet_aton)"
+            r"|ftplib|smtplib|paramiko|telnetlib|xmlrpc\.client"
+            r")\b"
+            r"|\.sendall\s*\("
+            r"|\.sendto\s*\("),
     ),
     EffectPattern(
         "credential_access",
@@ -107,6 +143,12 @@ SCOPE_ALLOWANCES: dict[str, frozenset[str]] = {
     "pure": frozenset(),
     "read_only": frozenset(),
     "local_write": frozenset({"filesystem_write"}),
+    # Deletion, and only deletion. A write can be undone by another write;
+    # a delete cannot be undone by anything this table can see. Kept out of
+    # `local_write` so that a tool declaring `deletes:file` while writing
+    # files is still a contract violation, and kept narrow so that the
+    # narrowest honest signature gets the narrowest honest scope.
+    "destructive": frozenset({"filesystem_delete"}),
     "network": frozenset({"network_egress"}),
     "system": frozenset({
         "filesystem_write", "subprocess", "network_egress",
@@ -163,10 +205,229 @@ def audit_effects(code: str) -> list[EffectFinding]:
     return findings
 
 
+#: Scopes ordered by how much they permit, so a signature that names several
+#: effects can be translated to the smallest scope that covers all of them.
+#: Kept here rather than imported from `autonomy/scopes.py` because this module
+#: owns `SCOPE_ALLOWANCES`; the ordering is a property of that table, not of the
+#: autonomy layer that reads it.
+_SCOPE_ORDER: tuple[str, ...] = (
+    "pure",
+    "read_only",
+    "local_write",
+    # `destructive` permits one label and `local_write` permits a different
+    # one, so their relative order changes no answer -- neither is a superset
+    # of the other. They sit next to each other because they are both
+    # filesystem effects and a reader should meet them together.
+    "destructive",
+    "network",
+    "system",
+    "privileged",
+)
+
+#: The words a `reads:<what>` / `writes:<what>` signature may use, and the
+#: effect labels each one implies.
+#:
+#: Why this table exists at all
+#: ----------------------------
+#: `forge/generator.py:375` tells the model to write
+#: `"effect_signature": "pure | reads:<what> | writes:<what>"`. Nothing in this
+#: package understood that syntax: `declared_scope` and
+#: `autonomy/confirm._normalise_scope` both only accepted the seven fixed scope
+#: names, so every honestly-written `reads:filesystem` fell through to
+#: `undeclared` -- which `SCOPE_ALLOWANCES` defines as all eight capabilities.
+#: Measured 2026-11-04: a tool that reads one file was therefore treated as able
+#: to write, delete, execute and reach the network, and `autonomy/roles.py`'s
+#: critic -- whose whole allowance is `filesystem_read` -- refused every tool
+#: that told the truth about itself.
+#:
+#: The instruction and the parser were written months apart and never met. This
+#: is where they meet: the syntax the generator teaches, translated into the
+#: vocabulary the gate speaks.
+_SIGNATURE_HINTS: dict[str, frozenset[str]] = {
+    # Nothing at all. Kept as `pure` rather than folded into `read_only` because
+    # a tool that only computes with its arguments really is pure, and the audit
+    # below will catch the tool that claims it and opens a file anyway.
+    "pure": frozenset(),
+    "read": frozenset({"filesystem_read"}),
+    "reads": frozenset({"filesystem_read"}),
+    "local": frozenset({"filesystem_read"}),
+    "write": frozenset({"filesystem_write"}),
+    "writes": frozenset({"filesystem_write"}),
+    "delete": frozenset({"filesystem_delete"}),
+    "deletes": frozenset({"filesystem_delete"}),
+    "network": frozenset({"network_egress"}),
+    "net": frozenset({"network_egress"}),
+    "http": frozenset({"network_egress"}),
+    "subprocess": frozenset({"subprocess"}),
+    "spawns": frozenset({"subprocess"}),
+    "exec": frozenset({"dynamic_code_execution", "subprocess"}),
+    "eval": frozenset({"dynamic_code_execution"}),
+    "code": frozenset({"dynamic_code_execution"}),
+    "privileged": frozenset({
+        "filesystem_delete", "filesystem_write", "subprocess", "network_egress",
+        "credential_access", "process_control", "dynamic_code_execution",
+        "deserialization",
+    }),
+    "admin": frozenset({
+        "filesystem_delete", "filesystem_write", "subprocess", "network_egress",
+        "credential_access", "process_control", "dynamic_code_execution",
+        "deserialization",
+    }),
+    # Named capabilities, for a signature that spells out the label directly.
+    "filesystem_read": frozenset({"filesystem_read"}),
+    "filesystem_write": frozenset({"filesystem_write"}),
+    "filesystem_delete": frozenset({"filesystem_delete"}),
+    "network_egress": frozenset({"network_egress"}),
+    "process_control": frozenset({"process_control"}),
+    "dynamic_code_execution": frozenset({"dynamic_code_execution"}),
+    "deserialization": frozenset({"deserialization"}),
+    "credential_access": frozenset({"credential_access"}),
+}
+
+#: Prefixes that may introduce a lower-case word in a signature.
+_SIGNATURE_PREFIXES = ("reads", "read", "writes", "write", "deletes", "delete")
+
+#: `reads:<prose>` / `writes:<prose>`, where the object runs to the next
+#: separator and may contain spaces.
+#:
+#: One pattern, used for both reading the verb and consuming the object.
+#: Measured 2026-11-04: the first version had two -- a `finditer` with `[^,;+]*`
+#: and a `re.sub` with the same class typed out a second time. Mutation testing
+#: narrowed the `finditer` copy to `(\S*)` and the suite still passed, because
+#: the `sub` copy went on eating the whole prose tail: two encodings of one
+#: boundary, and the more generous one silently decides. They are now derived
+#: from this single string, so they cannot disagree.
+_SIGNATURE_CALL = re.compile(r"\b(reads|read|writes|write|deletes|delete)\s*:\s*([^,;+]*)")
+
+#: Labels that every scope permits, and that the translate loop below must
+#: therefore ignore when it asks "which scope is big enough for these?".
+#:
+#: Was a known limit until 2026-11-05: `filesystem_delete` had no scope of its
+#: own, so `deletes:file` translated to `privileged` -- all eight capabilities,
+#: a wider claim than the tool made, and `derived_scope` over `os.remove(p)`
+#: answered `undeclared` for the same reason. Both are fixed by the
+#: `destructive` scope, which is why this table now has seven entries. The
+#: reasoning that kept the translator from inventing one still holds: a scope
+#: invented here would not be one the gate knows how to enforce, so the scope
+#: was added to the table and to `autonomy/confirm._SCOPE_EXTRA` together.
+#:
+#: Measured 2026-11-04, and it is the reason the first version of
+#: `scope_of_signature` returned "unreadable" for the single most common honest
+#: signature. `SCOPE_ALLOWANCES` has no scope whose label set contains
+#: `filesystem_read`: reading is free everywhere, so nothing gates it. A
+#: translator that mechanically asks "does this scope cover {filesystem_read}"
+#: gets `no` from all seven and concludes the string cannot be read -- turning
+#: `reads:file`, the most honest signature a tool can write, into `undeclared`,
+#: which permits all eight capabilities. `autonomy/confirm._SCOPE_EXTRA` already
+#: encodes this same fact from the other side by adding `filesystem_read` to
+#: every scope's capabilities.
+_ALWAYS_ALLOWED: frozenset[str] = frozenset({"filesystem_read"})
+
+
+def scope_of_signature(signature: str) -> str:
+    """Translate an `effect_signature` into a scope name, or `""` if unreadable.
+
+    Returns `""` -- *not* `read_only` and *not* `undeclared` -- when the string
+    is not something this function can read. The caller decides what to do with
+    that: `declared_scope` turns it into `undeclared` (capable of everything),
+    which is the fail-closed reading for a tool nobody can classify.
+
+    Accepts, in any combination and separated by `,`, `;`, `+` or whitespace:
+
+        pure
+        reads:filesystem          writes:filesystem
+        reads:file, writes:file   network
+        subprocess                privileged
+
+    A `reads:`/`writes:` word after the colon is not interpreted as a list of
+    file paths -- the model writes prose there (`reads:a file the operator
+    names`). Only the verb in front of the colon is load-bearing, and the label
+    it maps to is the narrowest one that covers it. Being generous about the
+    object is deliberate: the alternative is that an honest signature is
+    rejected for containing a space, which is how the field ended up empty
+    everywhere in the first place.
+
+    A signature that names several effects gets the smallest scope covering all
+    of them, which is why the scan walks `_SCOPE_ORDER` upward and takes the
+    first fit rather than the largest claim it saw.
+    """
+    raw = (signature or "").strip().lower()
+    if not raw:
+        return ""
+    # A bare scope name is the other accepted spelling, and the one every
+    # existing row in the database uses.
+    if raw in SCOPE_ALLOWANCES:
+        return raw
+
+    labels: set[str] = set()
+    seen_any = False
+
+    # The object of `reads:`/`writes:` is prose, not a list of paths: the
+    # generator's prompt gives the model a free-text slot and models fill it with
+    # things like `reads:a file the operator names`. So these are consumed off
+    # the raw string first, and whatever follows the colon up to the next
+    # separator belongs to the verb.
+    #
+    # Measured 2026-11-04: the first version of this function split on whitespace
+    # first, so `reads:a file the operator names` left `a`, `file`, `the` ...
+    # as bare tokens, `a` was not a known word, and the whole signature came
+    # back unreadable -- which is `undeclared`, which is all eight capabilities.
+    # The most honest sentence a tool can write about itself was being punished
+    # for containing a space, which is how this field ended up `""` everywhere to
+    # begin with.
+    for match in _SIGNATURE_CALL.finditer(raw):
+        verb = match.group(1)
+        if verb not in _SIGNATURE_PREFIXES:      # pragma: no cover - regex is the list
+            return ""
+        labels |= _SIGNATURE_HINTS.get(verb, frozenset())
+        seen_any = True
+    rest = _SIGNATURE_CALL.sub(" ", raw)
+
+    for token in re.split(r"[,;+\s]+", rest):
+        token = token.strip("()[]{}'\"")
+        if not token:
+            continue
+        if ":" in token:
+            # `something:else` with a verb we do not know. Unreadable, and
+            # guessing here would be this module asserting innocence on behalf
+            # of a signature it did not understand.
+            return ""
+        if token in _SIGNATURE_HINTS:
+            labels |= _SIGNATURE_HINTS[token]
+            seen_any = True
+            continue
+        return ""
+
+    if not seen_any:
+        return ""
+    needed = labels - _ALWAYS_ALLOWED
+    if not needed:
+        # Every label it named is permitted by every scope, i.e. it named only
+        # reads. The answer is `read_only`, not `pure`: `pure` is a claim that
+        # the tool touches nothing at all, and a tool that says `reads:` has
+        # just told us it touches a file. `_scope_gate` and `scope_creep` treat
+        # the two differently, so answering `pure` here would hand a
+        # file-reading tool a contract it cannot keep.
+        #
+        # Measured 2026-11-04: without this, `reads:file` translated to `pure`.
+        return "read_only"
+    for scope in _SCOPE_ORDER:
+        if needed <= set(SCOPE_ALLOWANCES.get(scope, frozenset())):
+            return scope
+    return ""
+
+
 def declared_scope(spec: ToolSpec) -> str:
-    """Read the scope a tool claims. `effect_signature` is the contract field."""
-    sig = (spec.effect_signature or "").strip().lower()
-    return sig if sig in SCOPE_ALLOWANCES else "undeclared"
+    """Read the scope a tool claims. `effect_signature` is the contract field.
+
+    Now goes through `scope_of_signature`, so the `reads:`/`writes:` spelling
+    the generator teaches translates into a real scope instead of collapsing to
+    `undeclared`. What is still *not* read as a scope is a signature this
+    module cannot parse, and that keeps its fail-closed meaning: a tool that
+    never said what it touches is treated as touching everything.
+    """
+    scope = scope_of_signature(spec.effect_signature)
+    return scope or "undeclared"
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +631,10 @@ SCOPE_CONTEXT_CEILING: dict[str, int] = {
     "pure": 4,          # a pure function is safe anywhere it is fed data
     "read_only": 4,
     "local_write": 1,
+    # Deletion is irreversible, so reuse above `public` needs
+    # re-verification -- the same ceiling as `privileged`, and the only
+    # ceiling in this table reached for a reason other than reach.
+    "destructive": 0,
     "network": 1,       # egress against sensitive data is the leak case
     "system": 1,
     "privileged": 0,
@@ -591,7 +856,188 @@ _JUDGE_SYSTEM = (
 )
 
 
+# ---------------------------------------------------------------------------
+# A second opinion: what does this tool actually do, and is that what it said?
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ReviewFinding:
+    """One objection a reviewer raised against a tool's own account of itself."""
+
+    name: str
+    ok: bool
+    detail: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ReviewVerdict:
+    """The reviewer's reading of one tool.
+
+    This is *not* a second verification battery. The battery asks "does it work
+    when called?"; this asks "does the sentence it writes about itself match the
+    code beside it?" -- two questions that fail independently, which is why they
+    are two objects rather than one report with more checks in it.
+
+    `ok` is true only when nothing objected. Every check that could not be made
+    is listed in `unreviewed` instead of being counted as a pass: a review that
+    silently skips is the thing it exists to catch.
+    """
+
+    tool: str
+    scope: str
+    effects: list[str] = field(default_factory=list)
+    findings: list[ReviewFinding] = field(default_factory=list)
+    reviewed: bool = True
+    error: str = ""
+    at: float = 0.0
+
+    @property
+    def ok(self) -> bool:
+        """True when the review ran and nothing objected."""
+        if not self.reviewed or self.error:
+            return False
+        return all(f.ok for f in self.findings)
+
+    @property
+    def objectors(self) -> list[ReviewFinding]:
+        return [f for f in self.findings if not f.ok]
+
+    def summary(self) -> str:
+        if self.error:
+            return f"review of {self.tool}: could not run -- {self.error}"
+        if not self.reviewed:
+            return f"review of {self.tool}: not reviewed"
+        if self.ok:
+            return (f"review of {self.tool}: scope {self.scope!r}, "
+                    f"{len(self.findings)} check(s), nothing objected")
+        names = ", ".join(f.name for f in self.objectors)
+        return f"review of {self.tool}: scope {self.scope!r}, objected: {names}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tool": self.tool,
+            "ok": self.ok,
+            "scope": self.scope,
+            "effects": list(self.effects),
+            "findings": [
+                {"name": f.name, "ok": f.ok, "detail": f.detail,
+                 **({"data": f.data} if f.data else {})}
+                for f in self.findings
+            ],
+            "reviewed": self.reviewed,
+            "error": self.error,
+            "at": self.at,
+        }
+
+
+#: Scopes where a reviewer is permitted to look at a tool's code and say so.
+#: `pure` is here because it is the narrowest claim in the table, not because it
+#: is safe: a tool that claims `pure` and opens a socket is the case this whole
+#: review exists to catch, and refusing to review it would be backwards.
+def review_tool(spec: ToolSpec, *, now: float | None = None) -> ReviewVerdict:
+    """Read one tool's claims against one tool's code, and object where they part.
+
+    Why this is a separate function from `ValidityGate`
+    ---------------------------------------------------
+    `ValidityGate` answers a question about *change*: is this mutant worse than
+    the baseline it was bred from? Its strong checks (`scope_creep`,
+    `require_scope_declaration`) only mean anything against a `FrozenBaseline`,
+    and a tool that has never been evolved has none -- so on a brand-new tool the
+    gate's scope check is the weakest branch, guarded by a flag that defaults to
+    False. Measured 2026-11-04: with `require_scope_declaration` at its default,
+    a tool declaring `pure` and writing a file passes the gate.
+
+    This function asks the question that needs no baseline, and it is the one the
+    operator asked for: **does the declared signature cover what the code does?**
+    It is deliberately narrow -- three questions, each answerable from the spec
+    alone -- because a reviewer with an opinion about everything gets read by
+    nobody.
+
+    The three questions:
+
+    1. **Undecidable signature.** `scope_of_signature` could not read it. Not an
+       objection about the code; an objection about the sentence. A tool whose
+       own account of itself cannot be parsed has not told the reviewer
+       anything, and `undeclared` is what the gate reads it as.
+    2. **Contract lie.** The code exercises an effect the declared scope does
+       not permit. This is the objection.
+    3. **Untraceable.** No code at all. A spec with an empty `code` field cannot
+       be reviewed, and reporting it as clean would be a reviewer signing a page
+       it never read.
+
+    Deliberately *not* included: any judgement about whether the tool is useful,
+    whether its checks pass, or whether it should be promoted. Those belong to
+    the battery and to the state machine. A reviewer that also promotes has
+    become the thing it reviews.
+    """
+    verdict = ReviewVerdict(
+        tool=getattr(spec, "name", "?"),
+        scope="",
+        at=float(now if now is not None else time.time()),
+    )
+    try:
+        code = getattr(spec, "code", "") or ""
+        signature = getattr(spec, "effect_signature", "") or ""
+        scope = scope_of_signature(signature)
+        verdict.scope = scope or "undeclared"
+
+        findings = verdict.findings
+        findings.append(ReviewFinding(
+            "signature", bool(scope),
+            (f"declared {signature.strip()!r} reads as {scope!r}" if scope
+             else f"declared {signature.strip()!r} is not a signature this "
+                  f"package can read; the gate treats it as 'undeclared', "
+                  f"which permits every capability"),
+            {"signature": signature.strip(), "scope": scope or "undeclared"},
+        ))
+
+        if not code.strip():
+            findings.append(ReviewFinding(
+                "readable", False,
+                "the spec carries no code, so there was nothing to review; "
+                "an empty review reported as clean is a signature on a blank page",
+            ))
+            verdict.reviewed = False
+            return verdict
+        findings.append(ReviewFinding("readable", True, "the spec carries code to review"))
+
+        effects = audit_effects(code)
+        labels = sorted({f.label for f in effects})
+        verdict.effects = labels
+        allowed = SCOPE_ALLOWANCES.get(verdict.scope, SCOPE_ALLOWANCES["undeclared"])
+        # No read exemption here, on purpose. `_EFFECT_PATTERNS` has no
+        # `filesystem_read` entry -- reading is free under every scope, so
+        # nothing gates it -- which means `labels` can never contain that word
+        # and an exemption for it would be a guard that cannot fire. Measured
+        # 2026-11-04: the first version subtracted `_ALWAYS_ALLOWED` here, and
+        # deleting the subtraction left every mutant passing, because it was
+        # filtering a value the auditor never emits. `_ALWAYS_ALLOWED` still
+        # earns its place in `scope_of_signature`, where `reads:...` genuinely
+        # produces the word. If a read pattern is ever added to
+        # `_EFFECT_PATTERNS`, the exemption has to come back with it.
+        violations = [lab for lab in labels if lab not in allowed]
+        findings.append(ReviewFinding(
+            "contract", not violations,
+            ("the code exercises nothing outside the declared scope" if not violations
+             else f"contract lie: scope {verdict.scope!r} does not permit "
+                  f"{', '.join(violations)}"),
+            {"effects": labels, "violations": violations,
+             "lines": [f.to_dict() for f in effects if f.label in violations]},
+        ))
+        return verdict
+    except Exception as exc:                                    # noqa: BLE001
+        # A reviewer that raises has told the caller nothing about the tool, and
+        # a crash read as "no objections" would be the worst possible answer.
+        verdict.reviewed = False
+        verdict.error = f"{type(exc).__name__}: {exc}"
+        return verdict
+
+
 __all__ = [
+    "ReviewFinding",
+    "ReviewVerdict",
+    "review_tool",
+    "scope_of_signature",
     "ValidityGate",
     "ValidityReport",
     "ValidityFinding",
